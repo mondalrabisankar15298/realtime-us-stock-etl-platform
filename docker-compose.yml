@@ -1,0 +1,476 @@
+services:
+  # ==========================================
+  # Redpanda - Kafka API Compatible Broker
+  # ==========================================
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v23.3.3
+    container_name: redpanda
+    command:
+      - redpanda
+      - start
+      - --smp
+      - '1'
+      - --reserve-memory
+      - 0M
+      - --overprovisioned
+      - --node-id
+      - '0'
+      - --kafka-addr
+      - PLAINTEXT://0.0.0.0:29092,OUTSIDE://0.0.0.0:7000
+      - --advertise-kafka-addr
+      - PLAINTEXT://redpanda:29092,OUTSIDE://localhost:7000
+      - --pandaproxy-addr
+      - PLAINTEXT://0.0.0.0:28082,OUTSIDE://0.0.0.0:7001
+      - --advertise-pandaproxy-addr
+      - PLAINTEXT://redpanda:28082,OUTSIDE://localhost:7001
+      - --rpc-addr
+      - 0.0.0.0:33145
+      - --advertise-rpc-addr
+      - redpanda:33145
+    ports:
+      - "7000:9092"
+      - "7001:28082"
+      - "7002:9644"
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    networks:
+      - stock-etl-network
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+
+  # Redpanda Console for monitoring
+  redpanda-console:
+    image: docker.redpanda.com/redpandadata/console:v2.4.3
+    container_name: redpanda-console
+    entrypoint: /bin/sh
+    command: -c 'echo "$$CONSOLE_CONFIG_FILE" > /tmp/config.yml; PORT=7003 /app/console'
+    environment:
+      CONFIG_FILEPATH: /tmp/config.yml
+      PORT: 7003
+      CONSOLE_CONFIG_FILE: |
+        kafka:
+          brokers: ["redpanda:29092"]
+          schemaRegistry:
+            enabled: false
+        connect:
+          enabled: false
+    ports:
+      - "7003:7003"
+    networks:
+      - stock-etl-network
+    depends_on:
+      - redpanda
+
+  # ==========================================
+  # Spark Master & Workers
+  # ==========================================
+  spark-master:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    image: stock-etl-spark:latest
+    container_name: spark-master
+    command: >
+      bash -c "
+      /opt/spark/sbin/start-master.sh
+      --host spark-master
+      --port 7077
+      --webui-port 8080
+      && tail -f /opt/spark/logs/*.out
+      "
+    environment:
+      - SPARK_MASTER_WEBUI_PORT=8080
+      - SPARK_UI_PORT=4040
+    ports:
+      - "7004:8080"
+      - "7005:7077"
+      - "7006:4040"
+    volumes:
+      - ./spark:/opt/spark-jobs
+      - spark-delta-tables:/opt/spark/delta_tables
+      - spark-checkpoints:/opt/spark/checkpoints
+      - ./spark/jars:/opt/spark/jars
+    networks:
+      - stock-etl-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  spark-worker-1:
+    image: stock-etl-spark:latest
+    container_name: spark-worker-1
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=${SPARK_WORKER_MEMORY}
+      - SPARK_WORKER_CORES=${SPARK_WORKER_CORES}
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    volumes:
+      - ./spark:/opt/spark-jobs
+      - spark-delta-tables:/opt/spark/delta_tables
+      - spark-checkpoints:/opt/spark/checkpoints
+      - ./spark/jars:/opt/spark/jars
+    networks:
+      - stock-etl-network
+    depends_on:
+      - spark-master
+
+  spark-worker-2:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    image: stock-etl-spark:latest
+    container_name: spark-worker-2
+    command: >
+      bash -c "
+      /opt/spark/sbin/start-worker.sh
+      spark://spark-master:7077
+      --webui-port 8081
+      && tail -f /opt/spark/logs/*.out
+      "
+    environment:
+      - SPARK_WORKER_MEMORY=${SPARK_WORKER_MEMORY}
+      - SPARK_WORKER_CORES=${SPARK_WORKER_CORES}
+    volumes:
+      - ./spark:/opt/spark-jobs
+      - spark-delta-tables:/opt/spark/delta_tables
+      - spark-checkpoints:/opt/spark/checkpoints
+      - ./spark/jars:/opt/spark/jars
+    networks:
+      - stock-etl-network
+    depends_on:
+      - spark-master
+
+  # ==========================================
+  # PostgreSQL for Airflow Metadata
+  # ==========================================
+  postgres-airflow:
+    image: postgres:15-alpine
+    container_name: postgres-airflow
+    environment:
+      - POSTGRES_USER=airflow
+      - POSTGRES_PASSWORD=airflow
+      - POSTGRES_DB=airflow
+    volumes:
+      - postgres-airflow-data:/var/lib/postgresql/data
+    ports:
+      - "7007:5432"
+    networks:
+      - stock-etl-network
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      retries: 5
+
+  # ==========================================
+  # TimescaleDB for Grafana Data Source
+  # PostgreSQL-compatible time-series database
+  # ==========================================
+  postgres-timescale:
+    image: timescale/timescaledb:latest-pg15
+    container_name: postgres-timescale
+    environment:
+      - POSTGRES_USER=${POSTGRES_GRAFANA_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_GRAFANA_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_GRAFANA_DB}
+    volumes:
+      - timescale-data:/var/lib/postgresql/data
+      - ./scripts/init-timescale.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "7008:5432"
+    networks:
+      - stock-etl-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U grafana"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    command: 
+      - postgres
+      - -c
+      - shared_preload_libraries=timescaledb
+
+  # ==========================================
+  # Airflow - Workflow Orchestration
+  # ==========================================
+  airflow-init:
+    image: apache/airflow:2.8.0-python3.11
+    container_name: airflow-init
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=${AIRFLOW__CORE__EXECUTOR}
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=${AIRFLOW__DATABASE__SQL_ALCHEMY_CONN}
+      - AIRFLOW__CORE__FERNET_KEY=${AIRFLOW__CORE__FERNET_KEY}
+      - AIRFLOW__CORE__LOAD_EXAMPLES=${AIRFLOW__CORE__LOAD_EXAMPLES}
+      - _AIRFLOW_DB_MIGRATE=true
+      - _AIRFLOW_WWW_USER_CREATE=true
+      - _AIRFLOW_WWW_USER_USERNAME=admin
+      - _AIRFLOW_WWW_USER_PASSWORD=admin
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./producer:/opt/airflow/producer
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - stock-etl-network
+    depends_on:
+      postgres-airflow:
+        condition: service_healthy
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@example.com || true
+        echo "Airflow initialization complete"
+
+  airflow-webserver:
+    image: apache/airflow:2.8.0-python3.11
+    container_name: airflow-webserver
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=${AIRFLOW__CORE__EXECUTOR}
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=${AIRFLOW__DATABASE__SQL_ALCHEMY_CONN}
+      - AIRFLOW__CORE__FERNET_KEY=${AIRFLOW__CORE__FERNET_KEY}
+      - AIRFLOW__CORE__LOAD_EXAMPLES=${AIRFLOW__CORE__LOAD_EXAMPLES}
+      - AIRFLOW__WEBSERVER__SECRET_KEY=${AIRFLOW__WEBSERVER__SECRET_KEY}
+      - AIRFLOW__API__AUTH_BACKENDS=${AIRFLOW__API__AUTH_BACKENDS}
+      - AIRFLOW__WEBSERVER__WEB_SERVER_PORT=7009
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./producer:/opt/airflow/producer
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "7009:7009"
+    networks:
+      - stock-etl-network
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      postgres-airflow:
+        condition: service_healthy
+    command: webserver
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:7009/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  airflow-scheduler:
+    image: apache/airflow:2.8.0-python3.11
+    container_name: airflow-scheduler
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=${AIRFLOW__CORE__EXECUTOR}
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=${AIRFLOW__DATABASE__SQL_ALCHEMY_CONN}
+      - AIRFLOW__CORE__FERNET_KEY=${AIRFLOW__CORE__FERNET_KEY}
+      - AIRFLOW__CORE__LOAD_EXAMPLES=${AIRFLOW__CORE__LOAD_EXAMPLES}
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./producer:/opt/airflow/producer
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - stock-etl-network
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      postgres-airflow:
+        condition: service_healthy
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  # ==========================================
+  # Producer - Stock Data Ingestion
+  # ==========================================
+  producer:
+    build:
+      context: .
+      dockerfile: Dockerfile.producer
+    container_name: stock-producer
+    environment:
+      - REDPANDA_BROKER=${REDPANDA_BROKER}
+      - KAFKA_TOPIC_RAW=${KAFKA_TOPIC_RAW}
+      - KAFKA_TOPIC_DLQ=${KAFKA_TOPIC_DLQ}
+      - STOCK_TICKERS=${STOCK_TICKERS}
+      - PRODUCER_INTERVAL_SECONDS=${PRODUCER_INTERVAL_SECONDS}
+      - PRODUCER_MAX_RETRIES=${PRODUCER_MAX_RETRIES}
+      - PRODUCER_RETRY_DELAY=${PRODUCER_RETRY_DELAY}
+      - TZ=${TZ}
+    volumes:
+      - ./producer/state:/app/state
+      - ./producer/logs:/app/logs
+    networks:
+      - stock-etl-network
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ==========================================
+  # Spark Streaming Jobs - Automated
+  # ==========================================
+  spark-bronze:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    image: stock-etl-spark:latest
+    container_name: spark-bronze-job
+    environment:
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    volumes:
+      - ./spark:/opt/spark-jobs
+      - spark-delta-tables:/opt/spark/delta_tables
+      - spark-checkpoints:/opt/spark/checkpoints
+      - ./spark/jars:/opt/spark/jars
+    networks:
+      - stock-etl-network
+    depends_on:
+      spark-master:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+    command: >
+      bash -c "
+      echo 'Waiting for Spark master...' &&
+      sleep 30 &&
+      echo 'Starting Bronze Layer Ingestion...' &&
+      spark-submit \
+        --master spark://spark-master:7077 \
+        --packages io.delta:delta-core_2.12:2.4.0,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0 \
+        --conf spark.sql.streaming.checkpointLocation.checkpointSchema=true \
+        /opt/spark-jobs/jobs/bronze_ingestion.py
+      "
+    restart: unless-stopped
+
+  spark-silver:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    image: stock-etl-spark:latest
+    container_name: spark-silver-job
+    environment:
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    volumes:
+      - ./spark:/opt/spark-jobs
+      - spark-delta-tables:/opt/spark/delta_tables
+      - spark-checkpoints:/opt/spark/checkpoints
+      - ./spark/jars:/opt/spark/jars
+    networks:
+      - stock-etl-network
+    depends_on:
+      spark-master:
+        condition: service_healthy
+      spark-bronze:
+        condition: service_started
+    command: >
+      bash -c "
+      echo 'Waiting for Bronze layer...' &&
+      sleep 40 &&
+      echo 'Starting Silver Layer Cleaning...' &&
+      spark-submit
+      --master spark://spark-master:7077
+      --packages io.delta:delta-core_2.12:2.4.0
+      --conf spark.sql.streaming.checkpointLocation.checkpointSchema=true
+      /opt/spark-jobs/jobs/silver_cleaning.py
+      "
+    restart: unless-stopped
+
+  spark-gold:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    image: stock-etl-spark:latest
+    container_name: spark-gold-job
+    environment:
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    volumes:
+      - ./spark:/opt/spark-jobs
+      - spark-delta-tables:/opt/spark/delta_tables
+      - spark-checkpoints:/opt/spark/checkpoints
+      - ./spark/jars:/opt/spark/jars
+    networks:
+      - stock-etl-network
+    depends_on:
+      spark-master:
+        condition: service_healthy
+      spark-silver:
+        condition: service_started
+    command: >
+      bash -c "
+      echo 'Waiting for Silver layer...' &&
+      sleep 50 &&
+      echo 'Starting Gold Layer KPI Computation...' &&
+      spark-submit \
+        --master spark://spark-master:7077 \
+        --packages io.delta:delta-core_2.12:2.4.0 \
+        --conf spark.sql.streaming.checkpointLocation.checkpointSchema=true \
+        /opt/spark-jobs/jobs/gold_kpis.py
+      "
+    restart: unless-stopped
+
+  # ==========================================
+  # Grafana - Visualization
+  # ==========================================
+  grafana:
+    image: grafana/grafana:10.2.3
+    container_name: grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GF_SECURITY_ADMIN_USER}
+      - GF_SECURITY_ADMIN_PASSWORD=${GF_SECURITY_ADMIN_PASSWORD}
+      - GF_INSTALL_PLUGINS=${GF_INSTALL_PLUGINS}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_HTTP_PORT=7010
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources
+    ports:
+      - "7010:7010"
+    networks:
+      - stock-etl-network
+    depends_on:
+      - postgres-timescale
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:7010/api/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  redpanda-data:
+  spark-delta-tables:
+  spark-checkpoints:
+  postgres-airflow-data:
+  timescale-data:
+  grafana-data:
+
+networks:
+  stock-etl-network:
+    driver: bridge
+

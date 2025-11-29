@@ -1,0 +1,284 @@
+Absolutely — here is a complete, industry-standard, professional project documentation for your Real-Time Stock Market ETL Pipeline, fully aligned with your stack (Docker, Redpanda, Spark, Delta, Airflow, Grafana).
+This is the final documentation you can include in your GitHub repository, resume project, or portfolio.
+
+📘 REAL-TIME STOCK MARKET ETL PIPELINE (Full Project Documentation)
+Near Real-Time US Market Data | End-to-End ETL | Streaming | Dashboard | Production-Style Architecture
+
+🏆 Project Overview
+This project is a real-time streaming ETL pipeline built entirely using free tools and running 100% in Docker. It ingests 1-minute live stock market data from Yahoo Finance via yfinance, processes it using Redpanda (Kafka API compatible) and Spark Structured Streaming, stores cleaned data in Delta Lake, orchestrates workflows in Airflow, and visualizes insights on Grafana.
+Everything is built like a real production pipeline used at fintech companies or trading firms — but free and local.
+
+🎯 Project Goals
+* Build a real-time data engineering pipeline with industry tools.
+* Ingest near real-time 1-minute OHLCV data for top 10 US stocks.
+* Apply streaming ETL, transformations, upserts, checkpoints, and idempotent MERGE.
+* Store cleaned data in Bronze, Silver, Gold Delta tables.
+* Run scheduled jobs with Airflow (monitoring, backfill, quality checks).
+* Create a premium Grafana dashboard with financial KPIs.
+* Design the entire project to be resume-ready & interview-ready.
+
+🏗️ High-Level Architecture
+              +---------------------+
+              |  Yahoo Finance API  |
+              | (via yfinance lib)  |
+              +----------+----------+
+                         |
+                         | 1-min fetch
+                         v
+               +---------+----------+
+               |   Producer (Py)    |
+               | Docker Container   |
+               +---------+----------+
+                         |
+                         | publish JSON
+                         v
+          +--------------+---------------+
+          |            Redpanda          |
+          | (Kafka API-compatible broker)|
+          +------+------------+----------+
+                 |            |
+     stream ---> |            | ---> DLQ topic
+                 v            v
+        +--------+------------+--------+
+        |     Spark Structured Stream  |
+        |    (Ingestion + ETL Layers)  |
+        +---------------+--------------+
+                        |
+                        | MERGE (idempotent)
+                        v
+        +----------------+----------------+
+        |   Delta Lake (Bronze/Silver/Gold) |
+        |  Stored as Delta/Parquet locally  |
+        +----------------+----------------+
+                        |
+                        v
+              +---------+---------+
+              |      Grafana      |
+              |   Real-time KPIs  |
+              +---------+---------+
+Airflow orchestrates:
+* producer health
+* scheduled batch jobs
+* backfills
+* monitoring DAGs
+* data quality checks
+
+🔥 Key Features (Industry Standard)
+1. Near Real-Time Producer
+* Runs every minute
+* Fetches top 10 US tickers
+* Uses yfinance (auto retry + safe parsing)
+* Writes last successful timestamp per symbol
+* Retries with exponential backoff
+* Follows idempotent design
+2. Redpanda Streaming Broker
+* Kafka-compatible
+* Topic partitioning by symbol
+* DLQ topic for failed messages
+* High-throughput real-time ingest
+3. Spark Structured Streaming ETL
+Implements Bronze → Silver → Gold architecture:
+Bronze Layer
+* Stores raw JSON from Redpanda
+* Behaves like a data lake landing zone
+Silver Layer
+* Type casting
+* De-duplication (timestamp + symbol)
+* Normalized schema
+* Timezone handling
+* Forward-filling missing values
+* Validation
+Gold Layer
+* Aggregated features
+* Trading KPIs
+* Time windows
+* Market-volatility metrics
+* Cleaned & enriched data for dashboarding
+4. Delta Lake
+* ACID transactions
+* MERGE for idempotency
+* Fast updates
+* Versioning (time travel)
+5. Airflow Orchestration
+* Runs producer every minute
+* Monitors producer health
+* Checks if new data arrived
+* Runs backfill DAG
+* Runs QC DAG (schema validation, completeness checks)
+* Monitors DLQ and alerts on bad messages
+* Rebuilds gold table daily
+6. Grafana Dashboard
+Fully production-style dashboard:
+
+📊 Grafana Dashboard Features (Industry-Ready)
+A. Real-Time Market Overview
+* 🚀 Live 1-minute Candle Chart for Each Ticker
+* Price, Volume, % Change
+* Best bid/ask (derived)
+* Market open/close flags
+B. Technical Indicators (Gold Layer)
+* SMA (5, 20, 50)
+* EMA (9, 21)
+* VWAP
+* RSI (14)
+* MACD (12/26, 9)
+* ATR
+C. Multi-Stock Comparison
+* Top Gainers
+* Top Losers
+* Volatility ranking
+* Correlation heatmap
+D. Portfolio Simulation Module
+(Not real portfolio — simulated using OHLCV)
+* Daily profit/loss
+* Risk / Sharpe ratio
+* Position-based returns
+E. System Monitoring
+* Kafka lag (per partition)
+* Producer error rate
+* Spark microbatch time
+* DLQ message count
+This gives your dashboard professional fintech-grade quality.
+
+🧱 Tech Stack (Final Confirmed)
+Data Source
+* Yahoo Finance (via yfinance)
+Streaming Broker
+* Redpanda (Kafka API compatible)
+Processing
+* Spark Structured Streaming
+* PySpark
+* Delta Lake
+Workflow Orchestration
+* Apache Airflow
+Storage
+* Local filesystem (Delta/Parquet)
+* Optional: MinIO (S3-like)
+Visualization
+* Grafana
+* Prometheus (optional)
+Deployment
+* Docker
+* docker-compose
+
+🧩 Data Model
+Raw Message (from producer)
+{
+  "symbol": "AAPL",
+  "timestamp": 1764352800,
+  "open": 277.5,
+  "high": 279.0,
+  "low": 276.8,
+  "close": 278.8,
+  "volume": 250000,
+  "ingested_at": "2025-03-17T12:00:00Z"
+}
+Silver Schema
+* symbol
+* ts (timestamp)
+* open (double)
+* high
+* low
+* close
+* volume
+* is_valid
+* ingestion_date
+Gold Schema (KPIs)
+* symbol
+* ts
+* close
+* daily_return
+* volatility_5m
+* sma_50
+* ema_21
+* rsi_14
+* vwap
+* market_phase (“open/pre/post”)
+
+⚙️ Failure Handling (Full Strategy)
+Producer
+* Exponential retry
+* State file for last timestamp
+* DLQ on final failure
+* Logging to Airflow
+* Backfill based on timestamp gaps
+Redpanda
+* Retention window: 48 hours
+* Partition by symbol
+* DLQ topic
+Spark
+* Checkpointing
+* MERGE for idempotency
+* Retry microbatch
+* Save failed microbatch to failed_batches
+Airflow
+* Email / Slack alerts
+* Producer heartbeat DAG
+* DLQ monitor DAG
+* Backfill DAG
+
+🛠️ Planned Folder Structure
+/stock-etl/
+   ├── docker-compose.yml
+   ├── producer/
+   │     ├── producer.py
+   │     ├── requirements.txt
+   │     └── state/
+   ├── airflow/
+   │     ├── dags/
+   │     │     ├── producer_dag.py
+   │     │     ├── monitoring_dag.py
+   │     │     ├── backfill_dag.py
+   │     │     └── qc_dag.py
+   ├── spark/
+   │     ├── jobs/
+   │     │     └── stream_etl.py
+   │     ├── delta_tables/
+   │     └── checkpoints/
+   ├── grafana/
+   │     ├── dashboards/
+   │     └── datasources/
+   ├── DLQ/
+   │     └── dlq_consumer.py
+   ├── docs/
+   │     ├── architecture.png
+   │     ├── dashboard_design.md
+   │     └── project_overview.md
+   └── README.md
+
+🚀 Implementation Plan (Step-by-Step)
+PHASE 1 — Setup
+* Setup docker-compose
+* Deploy Redpanda, Airflow, Spark, Grafana
+PHASE 2 — Producer
+* Implement yfinance fetch
+* Implement retry logic
+* Implement state tracking
+* Implement DLQ publishing
+PHASE 3 — Spark ETL
+* Bronze ingestion streaming
+* Silver cleaning
+* Gold KPI generation
+* MERGE + checkpoints
+PHASE 4 — Airflow
+* Producer schedule (1 min)
+* QC DAG
+* Monitoring DAG
+* Backfill DAG
+PHASE 5 — Grafana
+* Connect Delta → Spark SQL → Grafana
+* Build charts
+* Build KPIs
+* Build system monitoring panels
+PHASE 6 — Testing
+* Failure tests
+* Producer crash
+* Redpanda downtime
+* Spark retry
+* Backfill tests
+PHASE 7 — Documentation
+* README
+* Architecture diagram
+* Dashboard screenshots
+
+
