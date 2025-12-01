@@ -87,8 +87,9 @@ services:
     environment:
       - SPARK_MASTER_WEBUI_PORT=6004
       - SPARK_UI_PORT=4040
-      - SPARK_WORKER_MEMORY=4g
-      - SPARK_WORKER_CORES=4
+      - SPARK_WORKER_MEMORY=12g
+      - SPARK_WORKER_CORES=8
+      - SPARK_SHUFFLE_SERVICE_ENABLED=false
     ports:
       - "6004:6004"
       - "6005:7077"
@@ -101,7 +102,7 @@ services:
     networks:
       - stock-etl-network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080"]
+      test: ["CMD", "curl", "-f", "http://localhost:6004"]
       interval: 10s
       timeout: 3s
       retries: 3
@@ -331,11 +332,18 @@ services:
       sleep 30 &&
       echo 'Starting Bronze Layer Ingestion...' &&
       /opt/spark/bin/spark-submit
-        --master spark://spark-master:7077
+        --master local[*]
         --jars /opt/spark/jars/delta-core_2.12-2.4.0.jar,/opt/spark/jars/delta-storage-2.4.0.jar,/opt/spark/jars/spark-sql-kafka-0-10_2.12-3.4.1.jar,/opt/spark/jars/spark-token-provider-kafka-0-10_2.12-3.4.0.jar,/opt/spark/jars/kafka-clients-3.4.0.jar,/opt/spark/jars/commons-pool2-2.11.1.jar
         --conf spark.sql.streaming.checkpointLocation.checkpointSchema=true
         --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension
         --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog
+        --conf spark.dynamicAllocation.enabled=true
+        --conf spark.dynamicAllocation.minExecutors=1
+        --conf spark.dynamicAllocation.maxExecutors=2
+        --conf spark.dynamicAllocation.initialExecutors=1
+        --conf spark.dynamicAllocation.executorIdleTimeout=30s
+        --conf spark.executor.cores=2
+        --conf spark.executor.memory=2g
         /opt/spark-jobs/jobs/bronze_ingestion.py
       "]
     restart: unless-stopped
@@ -363,15 +371,11 @@ services:
       sleep 60 &&
       echo 'Starting Silver Layer Cleaning...' &&
       /opt/spark/bin/spark-submit
-        --master spark://spark-master:7077
+        --master local[*]
         --jars /opt/spark/jars/delta-core_2.12-2.4.0.jar,/opt/spark/jars/delta-storage-2.4.0.jar
         --conf spark.sql.streaming.checkpointLocation.checkpointSchema=true
         --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension
         --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog
-        --conf spark.executor.instances=1
-        --conf spark.executor.cores=1
-        --conf spark.executor.memory=1g
-        --conf spark.shuffle.service.enabled=false
         /opt/spark-jobs/jobs/silver_cleaning.py
       "]
     restart: unless-stopped
@@ -399,14 +403,14 @@ services:
       sleep 60 &&
       echo 'Starting Gold Layer KPI Computation...' &&
       /opt/spark/bin/spark-submit
-        --master spark://spark-master:7077
+        --master local[*]
         --jars /opt/spark/jars/delta-core_2.12-2.4.0.jar,/opt/spark/jars/delta-storage-2.4.0.jar
         --conf spark.sql.streaming.checkpointLocation.checkpointSchema=true
         --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension
         --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog
         --conf spark.executor.instances=1
-        --conf spark.executor.cores=1
-        --conf spark.executor.memory=1g
+        --conf spark.executor.cores=2
+        --conf spark.executor.memory=2g
         --conf spark.shuffle.service.enabled=false
         /opt/spark-jobs/jobs/gold_kpis.py
       "]

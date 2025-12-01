@@ -130,15 +130,15 @@ def check_silver_data_flow(**context):
 
 def should_start_gold(**context):
     """
-    Decide whether to start Gold layer based on Silver activity
+    Decide whether to start Gold layer based on Bronze activity (parallel execution)
     """
-    silver_active = check_silver_data_flow(**context)
+    bronze_active = check_bronze_data_flow(**context)
 
-    if silver_active:
-        print("🟢 Starting Gold layer - Silver is active")
+    if bronze_active:
+        print("🟢 Starting Gold layer - Bronze is active")
         return 'start_gold_layer'
     else:
-        print("🟡 Skipping Gold layer - Silver is not active")
+        print("🟡 Skipping Gold layer - Bronze is not active")
         return 'skip_gold_layer'
 
 
@@ -149,8 +149,8 @@ def start_silver_layer(**context):
     try:
         print("🚀 Starting Silver layer processing...")
 
-        # First, ensure Bronze has been running for a bit
-        time.sleep(30)  # Give Bronze time to accumulate some data
+        # Brief wait to ensure Bronze is stable
+        time.sleep(10)  # Give Bronze time to accumulate some data
 
         # Start Silver job
         result = subprocess.run(
@@ -180,8 +180,8 @@ def start_gold_layer(**context):
     try:
         print("🚀 Starting Gold layer processing...")
 
-        # Ensure Silver has been running for a bit
-        time.sleep(30)  # Give Silver time to process data
+        # Brief wait to ensure system stability
+        time.sleep(10)  # Give system time to stabilize
 
         # Start Gold job
         result = subprocess.run(
@@ -329,9 +329,8 @@ collect_metrics = PythonOperator(
     trigger_rule=TriggerRule.ALL_DONE,  # Run even if upstream tasks fail
 )
 
-# Task dependencies
-check_bronze >> silver_decision
+# Task dependencies - Parallel execution
+check_bronze >> [silver_decision, gold_decision]
 silver_decision >> [start_silver, skip_silver]
-start_silver >> gold_decision
 gold_decision >> [start_gold, skip_gold]
-[skip_silver, start_gold, skip_gold] >> collect_metrics
+[start_silver, skip_silver, start_gold, skip_gold] >> collect_metrics

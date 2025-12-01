@@ -7,6 +7,7 @@ Uses MERGE for idempotent upserts
 """
 
 import sys
+import os
 from pathlib import Path
 
 # Add parent directory to path for imports
@@ -171,6 +172,7 @@ def process_silver_stream():
     - Reads from Bronze Delta table
     - Applies cleaning and validation
     - Writes to Silver Delta table with MERGE (idempotent)
+    - Performs initial batch load if checkpoint doesn't exist
     """
     # Create Spark session
     spark = create_spark_session("SilverCleaning")
@@ -183,8 +185,42 @@ def process_silver_stream():
     print(f"Checkpoint location: {CHECKPOINT_PATH_SILVER}")
     print("=" * 80)
     
+    query = None
+    
     try:
-        # Read from Bronze Delta table as a stream
+        # Always try to do initial batch load if Silver table doesn't exist
+        # This ensures we process existing Bronze data on first run
+        silver_table_exists = os.path.exists(DELTA_PATH_SILVER) and os.path.isdir(DELTA_PATH_SILVER)
+        
+        if not silver_table_exists:
+            print("\n⚠ Silver table does not exist - performing initial batch load of existing Bronze data...")
+            sys.stdout.flush()
+            try:
+                # Check if Bronze table exists and has data
+                bronze_batch = spark.read.format("delta").load(DELTA_PATH_BRONZE)
+                bronze_count = bronze_batch.count()
+                
+                if bronze_count > 0:
+                    print(f"✓ Found {bronze_count} existing records in Bronze table")
+                    print("Processing initial batch...")
+                    
+                    # Apply transformations
+                    silver_batch = clean_and_validate(bronze_batch)
+                    
+                    # Process initial batch using the same upsert logic
+                    upsert_to_silver(silver_batch, batchId=0)
+                    
+                    print(f"✓ Initial batch load completed - processed {bronze_count} records")
+                else:
+                    print("⚠ Bronze table exists but is empty - waiting for new data...")
+            except Exception as e:
+                print(f"⚠ Bronze table may not exist yet or is empty: {e}")
+                print("Will process data once it arrives...")
+        else:
+            print(f"✓ Silver table already exists at {DELTA_PATH_SILVER}")
+        
+        # Now start streaming for new data
+        print("\nStarting streaming query for new data...")
         bronze_df = (
             spark.readStream
             .format("delta")
@@ -228,7 +264,8 @@ def process_silver_stream():
         
     except KeyboardInterrupt:
         print("\n\nStopping Silver cleaning stream...")
-        query.stop()
+        if query:
+            query.stop()
         print("✓ Stream stopped gracefully")
         
     except Exception as e:

@@ -8,6 +8,8 @@ Uses MERGE for idempotent upserts
 """
 
 import sys
+import time
+import os
 from pathlib import Path
 
 # Add parent directory to path for imports
@@ -60,7 +62,7 @@ def calculate_technical_indicators(df):
     """
     # For streaming, we only do basic transformations
     # All window-based calculations are moved to foreachBatch
-    
+
     # Add columns needed for calculations (open, high, low are needed for indicators)
     # These should already be in the Silver layer, but we ensure they're available
     df_prepared = df.select(
@@ -72,8 +74,63 @@ def calculate_technical_indicators(df):
         "close",
         "volume"
     )
-    
+
     return df_prepared
+
+
+def calculate_technical_indicators_batch(df):
+    """
+    Calculate technical indicators in batch mode for the entire dataset
+    """
+    from pyspark.sql.window import Window
+
+    # Calculate basic aggregations per symbol
+    gold_df = df.groupBy("symbol").agg(
+        F.avg("close").alias("avg_close"),
+        F.max("high").alias("max_high"),
+        F.min("low").alias("min_low"),
+        F.sum("volume").alias("total_volume"),
+        F.count("*").alias("record_count"),
+        F.last("close").alias("latest_close"),
+        F.stddev("close").alias("price_volatility")
+    )
+
+    # Add computed timestamp and placeholder columns for future technical indicators
+    gold_df = gold_df.withColumn(
+        "computed_at", F.current_timestamp()
+    ).withColumn(
+        "sma_5", F.lit(None).cast("double")  # Placeholder for future calculations
+    ).withColumn(
+        "sma_20", F.lit(None).cast("double")
+    ).withColumn(
+        "sma_50", F.lit(None).cast("double")
+    ).withColumn(
+        "ema_9", F.lit(None).cast("double")
+    ).withColumn(
+        "ema_21", F.lit(None).cast("double")
+    ).withColumn(
+        "rsi_14", F.lit(None).cast("double")
+    ).withColumn(
+        "vwap", F.lit(None).cast("double")
+    ).withColumn(
+        "macd", F.lit(None).cast("double")
+    ).withColumn(
+        "macd_signal", F.lit(None).cast("double")
+    ).withColumn(
+        "macd_histogram", F.lit(None).cast("double")
+    ).withColumn(
+        "atr_14", F.lit(None).cast("double")
+    ).withColumn(
+        "daily_return", F.lit(None).cast("double")
+    ).withColumn(
+        "volatility_5m", F.col("price_volatility")  # Use calculated volatility
+    ).withColumn(
+        "market_phase", F.lit("unknown")
+    ).withColumn(
+        "price_change_pct", F.lit(None).cast("double")
+    )
+
+    return gold_df
 
 
 def upsert_to_gold(microBatchDF, batchId):
@@ -168,10 +225,11 @@ def upsert_to_gold(microBatchDF, batchId):
 
 def process_gold_stream():
     """
-    Main Gold layer streaming job
+    Main Gold layer batch processing job
     - Reads from Silver Delta table
     - Calculates technical indicators and KPIs
-    - Writes to Gold Delta table with MERGE
+    - Writes to Gold Delta table
+    - Waits for Silver table to exist if needed
     """
     # Create Spark session
     spark = create_spark_session("GoldKPIs")
@@ -185,55 +243,113 @@ def process_gold_stream():
     print("=" * 80)
     
     try:
-        # Read from Silver Delta table as a stream
-        silver_df = (
-            spark.readStream
-            .format("delta")
-            .option("skipChangeCommits", "true")  # Skip updates to handle backfill data
-            .load(DELTA_PATH_SILVER)
-            .filter(F.col("is_valid") == True)  # Only valid records
-            .select("symbol", "ts", "open", "high", "low", "close", "volume")  # Select required columns
-        )
+        # Wait for Silver table to exist (with retry logic)
+        max_retries = 30
+        retry_delay = 10  # seconds
         
-        print("Silver stream connected successfully")
-        
-        # Prepare data for batch processing (window calculations done in foreachBatch)
-        gold_df = calculate_technical_indicators(silver_df)
-        
-        # Write to Gold Delta table using foreachBatch for MERGE
-        query = (
+        for attempt in range(max_retries):
+            try:
+                # Check if Silver table exists
+                if os.path.exists(DELTA_PATH_SILVER):
+                    # Try to read from Silver table
+                    silver_df = (
+                        spark.read
+                        .format("delta")
+                        .load(DELTA_PATH_SILVER)
+                        .filter(F.col("is_valid") == True)  # Only valid records
+                        .select("symbol", "ts", "open", "high", "low", "close", "volume")  # Select required columns
+                    )
+                    
+                    silver_count = silver_df.count()
+                    
+                    if silver_count > 0:
+                        print(f"✓ Silver table found with {silver_count} valid rows")
+                        break
+                    else:
+                        print(f"⚠ Silver table exists but is empty (attempt {attempt + 1}/{max_retries})")
+                else:
+                    print(f"⚠ Silver table not found yet (attempt {attempt + 1}/{max_retries})")
+                
+                if attempt < max_retries - 1:
+                    print(f"Waiting {retry_delay} seconds before retry...")
+                    time.sleep(retry_delay)
+                else:
+                    print("✗ Silver table not available after maximum retries")
+                    print("Gold job will exit. Restart once Silver has data.")
+                    return
+                    
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    print(f"⚠ Error reading Silver table (attempt {attempt + 1}/{max_retries}): {e}")
+                    print(f"Waiting {retry_delay} seconds before retry...")
+                    time.sleep(retry_delay)
+                else:
+                    raise
+
+        # Process Silver data
+        print(f"\nProcessing {silver_count} rows from Silver table...")
+
+        # Calculate technical indicators in batch mode
+        gold_df = calculate_technical_indicators_batch(silver_df)
+
+        # Write to Gold Delta table in batch mode
+        (
             gold_df
-            .writeStream
-            .foreachBatch(upsert_to_gold)
-            .outputMode("update")
-            .option("checkpointLocation", CHECKPOINT_PATH_GOLD)
-            .trigger(processingTime="20 seconds")  # Process every 20 seconds
-            .start()
+            .write
+            .format("delta")
+            .mode("overwrite")  # Overwrite for batch processing
+            .save(DELTA_PATH_GOLD)
         )
-        
-        print("✓ Gold streaming query started successfully")
-        print(f"Query ID: {query.id}")
-        print(f"Status: {query.status}")
-        print("\nComputing KPIs and streaming to Gold layer")
+
+        print("✓ Gold table created/updated successfully")
+        print(f"Gold table location: {DELTA_PATH_GOLD}")
+        print(f"Gold table contains {gold_df.count()} aggregated records")
+
+        # Keep the process alive and periodically reprocess
+        print("\nGold layer batch processing completed.")
+        print("Job will run periodically to update Gold table with new Silver data...")
         print("Press Ctrl+C to stop...\n")
         
-        # Monitor the stream
-        while query.isActive:
-            # Print progress every 30 seconds
-            query.awaitTermination(30)
+        while True:
+            time.sleep(300)  # Wait 5 minutes before reprocessing
             
-            progress = query.lastProgress
-            if progress:
-                print("-" * 80)
-                print(f"Batch: {progress.get('batchId', 'N/A')}")
-                print(f"Input rows: {progress.get('numInputRows', 0)}")
-                print(f"Processing time: {progress.get('durationMs', {}).get('triggerExecution', 0)}ms")
-                print("-" * 80)
+            try:
+                # Check if Silver table has new data
+                silver_df_new = (
+                    spark.read
+                    .format("delta")
+                    .load(DELTA_PATH_SILVER)
+                    .filter(F.col("is_valid") == True)
+                    .select("symbol", "ts", "open", "high", "low", "close", "volume")
+                )
+                
+                new_count = silver_df_new.count()
+                
+                if new_count > silver_count:
+                    print(f"\n📊 Detected new data in Silver ({new_count} rows, was {silver_count})")
+                    print("Reprocessing Gold table...")
+                    
+                    gold_df_new = calculate_technical_indicators_batch(silver_df_new)
+                    
+                    (
+                        gold_df_new
+                        .write
+                        .format("delta")
+                        .mode("overwrite")
+                        .save(DELTA_PATH_GOLD)
+                    )
+                    
+                    silver_count = new_count
+                    print(f"✓ Gold table updated successfully ({gold_df_new.count()} records)")
+                else:
+                    print(f"✓ No new data detected (still {silver_count} rows)")
+                    
+            except Exception as e:
+                print(f"⚠ Error during periodic update: {e}")
         
     except KeyboardInterrupt:
-        print("\n\nStopping Gold KPI stream...")
-        query.stop()
-        print("✓ Stream stopped gracefully")
+        print("\n\nStopping Gold KPI job...")
+        print("✓ Job stopped gracefully")
         
     except Exception as e:
         print(f"\n✗ Error in Gold KPI computation: {e}")

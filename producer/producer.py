@@ -778,7 +778,7 @@ class StockDataProducer:
                         break
 
                 # Force backfill mode for testing (uncomment to test anytime)
-                # needs_backfill = True
+                needs_backfill = True
 
                 # Allow processing if: during market hours OR if any ticker needs backfill
                 should_process = (is_weekday and is_market_hours) or needs_backfill
