@@ -44,6 +44,7 @@ cat .env
 **Note:** The `.env.example` file contains all default configuration values. You can customize:
 - `STOCK_TICKERS` - Change which stocks to track
 - `PRODUCER_INTERVAL_SECONDS` - Change fetch frequency
+- `BACKFILL_DAYS` - Change initial backfill duration (default: 30, max: 365)
 - `TZ` - Set your timezone
 - Passwords and other settings as needed
 

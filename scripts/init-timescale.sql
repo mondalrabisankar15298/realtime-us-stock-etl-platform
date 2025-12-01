@@ -1,7 +1,11 @@
 -- TimescaleDB Initialization Script
 -- Automatically executed when container first starts
 
--- Enable TimescaleDB extension
+-- Create databases
+CREATE DATABASE IF NOT EXISTS stockdata;
+
+-- Connect to stockdata database and enable TimescaleDB extension
+\c stockdata;
 CREATE EXTENSION IF NOT EXISTS timescaledb;
 
 -- ==========================================
@@ -228,6 +232,9 @@ ALTER DATABASE stockdata SET timescaledb.max_background_workers = 8;
 -- Grant all permissions to grafana user
 GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO grafana;
 GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO grafana;
+
+-- Grant connect permission to grafana user
+GRANT CONNECT ON DATABASE stockdata TO grafana;
 
 -- Success message
 DO $$

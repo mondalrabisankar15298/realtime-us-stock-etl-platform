@@ -31,6 +31,10 @@ RUN pip install --no-cache-dir \
 RUN mkdir -p /opt/spark/delta_tables /opt/spark/checkpoints /opt/spark-jobs && \
     chown -R spark:spark /opt/spark/delta_tables /opt/spark/checkpoints /opt/spark-jobs
 
+# Create Ivy cache directory for Spark user
+RUN mkdir -p /home/spark/.ivy2/cache && \
+    chown -R spark:spark /home/spark/.ivy2
+
 USER spark
 
 WORKDIR /opt/spark-jobs

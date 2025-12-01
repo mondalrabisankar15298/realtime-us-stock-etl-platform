@@ -30,16 +30,16 @@ def clean_and_validate(df):
     - Convert timestamp to proper TimestampType
     - Validate price and volume
     - Add validation flag
-    - Deduplicate by (symbol, timestamp)
     - Add partition column
+    Note: Deduplication moved to foreachBatch function for streaming compatibility
     """
-    
+
     # Convert Unix timestamp to TimestampType (UTC)
     df_cleaned = df.withColumn(
         "ts",
         F.from_unixtime(F.col("timestamp")).cast("timestamp")
     )
-    
+
     # Data validation rules
     df_cleaned = df_cleaned.withColumn(
         "is_valid",
@@ -56,30 +56,21 @@ def clean_and_validate(df):
             (F.col("volume") >= 0)
         )
     )
-    
+
     # Add ingestion date for partitioning (YYYY-MM-DD)
     df_cleaned = df_cleaned.withColumn(
         "ingestion_date",
         F.date_format(F.col("ts"), "yyyy-MM-dd")
     )
-    
+
     # Add processing timestamp
     df_cleaned = df_cleaned.withColumn(
         "processed_at",
         F.current_timestamp()
     )
-    
-    # Deduplicate by (symbol, ts) - keep latest bronze_timestamp
-    window_spec = Window.partitionBy("symbol", "ts").orderBy(F.col("bronze_timestamp").desc())
-    
-    df_cleaned = (
-        df_cleaned
-        .withColumn("row_num", F.row_number().over(window_spec))
-        .filter(F.col("row_num") == 1)
-        .drop("row_num")
-    )
-    
+
     # Select final columns for Silver layer
+    # Note: Deduplication will be done in foreachBatch to avoid streaming window restrictions
     df_silver = df_cleaned.select(
         "symbol",
         "ts",
@@ -90,9 +81,10 @@ def clean_and_validate(df):
         "volume",
         "is_valid",
         "ingestion_date",
-        "processed_at"
+        "processed_at",
+        "bronze_timestamp"  # Keep for deduplication in batch
     )
-    
+
     return df_silver
 
 
@@ -100,23 +92,39 @@ def upsert_to_silver(microBatchDF, batchId):
     """
     Upsert data to Silver Delta table using MERGE
     This ensures idempotency - same data won't create duplicates
+    Includes deduplication logic moved from streaming transformation
     """
-    
-    # Filter only valid records (optional: you can keep invalid for audit)
-    valid_df = microBatchDF.filter(F.col("is_valid") == True)
-    
-    if valid_df.count() == 0:
-        print(f"Batch {batchId}: No valid records to process")
+
+    if microBatchDF.count() == 0:
+        print(f"Batch {batchId}: No records to process")
         return
-    
-    print(f"Batch {batchId}: Processing {valid_df.count()} valid records")
-    
+
+    # Deduplicate by (symbol, ts) - keep latest bronze_timestamp
+    # This is done in batch processing since streaming windows are restricted
+    window_spec = Window.partitionBy("symbol", "ts").orderBy(F.col("bronze_timestamp").desc())
+
+    deduped_df = (
+        microBatchDF
+        .withColumn("row_num", F.row_number().over(window_spec))
+        .filter(F.col("row_num") == 1)
+        .drop("row_num", "bronze_timestamp")  # Remove bronze_timestamp after deduplication
+    )
+
+    # Filter only valid records (optional: you can keep invalid for audit)
+    valid_df = deduped_df.filter(F.col("is_valid") == True)
+
+    if valid_df.count() == 0:
+        print(f"Batch {batchId}: No valid records to process after deduplication")
+        return
+
+    print(f"Batch {batchId}: Processing {valid_df.count()} valid records (after deduplication)")
+
     # Check if Silver table exists
     spark = microBatchDF.sparkSession
-    
+
     try:
         silver_table = DeltaTable.forPath(spark, DELTA_PATH_SILVER)
-        
+
         # MERGE operation (upsert)
         (
             silver_table.alias("target")
@@ -138,13 +146,13 @@ def upsert_to_silver(microBatchDF, batchId):
             .whenNotMatchedInsertAll()
             .execute()
         )
-        
+
         print(f"Batch {batchId}: MERGE completed successfully")
-        
+
     except Exception as e:
         # Table doesn't exist - create it with initial write
         print(f"Batch {batchId}: Creating Silver table (first write)")
-        
+
         (
             valid_df
             .write
@@ -153,7 +161,7 @@ def upsert_to_silver(microBatchDF, batchId):
             .partitionBy("ingestion_date")
             .save(DELTA_PATH_SILVER)
         )
-        
+
         print(f"Batch {batchId}: Silver table created successfully")
 
 

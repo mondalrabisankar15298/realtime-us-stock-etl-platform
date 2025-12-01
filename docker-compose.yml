@@ -16,13 +16,13 @@ services:
       - --node-id
       - '0'
       - --kafka-addr
-      - PLAINTEXT://0.0.0.0:29092,OUTSIDE://0.0.0.0:9092
+      - PLAINTEXT://0.0.0.0:9092
       - --advertise-kafka-addr
-      - PLAINTEXT://redpanda:29092,OUTSIDE://localhost:6000
+      - PLAINTEXT://redpanda:9092
       - --pandaproxy-addr
-      - PLAINTEXT://0.0.0.0:28082,OUTSIDE://0.0.0.0:6001
+      - PLAINTEXT://0.0.0.0:28082
       - --advertise-pandaproxy-addr
-      - PLAINTEXT://redpanda:28082,OUTSIDE://localhost:6001
+      - PLAINTEXT://redpanda:28082
       - --rpc-addr
       - 0.0.0.0:33145
       - --advertise-rpc-addr
@@ -31,6 +31,7 @@ services:
       - "6000:9092"
       - "6001:28082"
       - "6002:9644"
+      - "29092:29092"
     volumes:
       - redpanda-data:/var/lib/redpanda/data
     networks:
@@ -52,7 +53,7 @@ services:
       PORT: 6003
       CONSOLE_CONFIG_FILE: |
         kafka:
-          brokers: ["redpanda:29092"]
+          brokers: ["redpanda:9092"]
           schemaRegistry:
             enabled: false
         connect:
@@ -78,16 +79,21 @@ services:
       /opt/spark/sbin/start-master.sh
       --host spark-master
       --port 7077
-      --webui-port 8080
+      --webui-port 6004 &
+      sleep 5 &&
+      /opt/spark/sbin/start-worker.sh spark://spark-master:7077
       && tail -f /opt/spark/logs/*.out
       "
     environment:
-      - SPARK_MASTER_WEBUI_PORT=8080
+      - SPARK_MASTER_WEBUI_PORT=6004
       - SPARK_UI_PORT=4040
+      - SPARK_WORKER_MEMORY=4g
+      - SPARK_WORKER_CORES=4
     ports:
-      - "6004:8080"
+      - "6004:6004"
       - "6005:7077"
       - "6006:4040"
+      - "6011:8081"
     volumes:
       - ./spark:/opt/spark-jobs
       - spark-delta-tables:/opt/spark/delta_tables
@@ -100,49 +106,7 @@ services:
       timeout: 3s
       retries: 3
 
-  spark-worker-1:
-    image: stock-etl-spark:latest
-    container_name: spark-worker-1
-    environment:
-      - SPARK_MODE=worker
-      - SPARK_MASTER_URL=spark://spark-master:7077
-      - SPARK_WORKER_MEMORY=${SPARK_WORKER_MEMORY}
-      - SPARK_WORKER_CORES=${SPARK_WORKER_CORES}
-      - SPARK_RPC_AUTHENTICATION_ENABLED=no
-      - SPARK_RPC_ENCRYPTION_ENABLED=no
-      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
-      - SPARK_SSL_ENABLED=no
-    volumes:
-      - ./spark:/opt/spark-jobs
-      - spark-delta-tables:/opt/spark/delta_tables
-      - spark-checkpoints:/opt/spark/checkpoints
-    networks:
-      - stock-etl-network
-    depends_on:
-      - spark-master
 
-  spark-worker-2:
-    image: stock-etl-spark:latest
-    container_name: spark-worker-2
-    command: >
-      bash -c "
-      /opt/spark/sbin/start-worker.sh
-      spark://spark-master:7077
-      --webui-port 8081
-      && tail -f /opt/spark/logs/*.out
-      "
-    environment:
-      - SPARK_WORKER_MEMORY=${SPARK_WORKER_MEMORY}
-      - SPARK_WORKER_CORES=${SPARK_WORKER_CORES}
-    volumes:
-      - ./spark:/opt/spark-jobs
-      - spark-delta-tables:/opt/spark/delta_tables
-      - spark-checkpoints:/opt/spark/checkpoints
-    networks:
-      - stock-etl-network
-    depends_on:
-      spark-master:
-        condition: service_started
 
   # ==========================================
   # PostgreSQL for Airflow Metadata
@@ -178,7 +142,8 @@ services:
       - POSTGRES_DB=${POSTGRES_GRAFANA_DB}
     volumes:
       - timescale-data:/var/lib/postgresql/data
-      - ./scripts/init-timescale.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./scripts/init-timescale.sql:/docker-entrypoint-initdb.d/01-init-timescale.sql
+      - ./scripts/init-grafana.sql:/docker-entrypoint-initdb.d/02-init-grafana.sql
     ports:
       - "6008:5432"
     networks:
@@ -188,10 +153,31 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-    command: 
+    command:
       - postgres
       - -c
       - shared_preload_libraries=timescaledb
+
+  # Init container to ensure Grafana database exists
+  # Runs after postgres-timescale is healthy
+  postgres-timescale-init:
+    image: timescale/timescaledb:latest-pg15
+    container_name: postgres-timescale-init
+    environment:
+      - POSTGRES_USER=${POSTGRES_GRAFANA_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_GRAFANA_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_GRAFANA_DB}
+      - PGHOST=postgres-timescale
+      - PGPORT=5432
+    volumes:
+      - ./scripts/ensure-grafana-db.sh:/ensure-grafana-db.sh
+    networks:
+      - stock-etl-network
+    depends_on:
+      postgres-timescale:
+        condition: service_healthy
+    command: ["/bin/bash", "/ensure-grafana-db.sh"]
+    restart: "no"
 
   # ==========================================
   # Airflow - Workflow Orchestration
@@ -300,10 +286,12 @@ services:
       - REDPANDA_BROKER=${REDPANDA_BROKER}
       - KAFKA_TOPIC_RAW=${KAFKA_TOPIC_RAW}
       - KAFKA_TOPIC_DLQ=${KAFKA_TOPIC_DLQ}
+      - KAFKA_TOPIC_BACKFILL_DLQ=${KAFKA_TOPIC_BACKFILL_DLQ}
       - STOCK_TICKERS=${STOCK_TICKERS}
       - PRODUCER_INTERVAL_SECONDS=${PRODUCER_INTERVAL_SECONDS}
       - PRODUCER_MAX_RETRIES=${PRODUCER_MAX_RETRIES}
       - PRODUCER_RETRY_DELAY=${PRODUCER_RETRY_DELAY}
+      - BACKFILL_DAYS=${BACKFILL_DAYS}
       - TZ=${TZ}
     volumes:
       - ./producer/state:/app/state
@@ -338,17 +326,18 @@ services:
         condition: service_healthy
       redpanda:
         condition: service_healthy
-    command: >
-      bash -c "
+    command: ["/bin/bash", "-c", "
       echo 'Waiting for Spark master...' &&
       sleep 30 &&
       echo 'Starting Bronze Layer Ingestion...' &&
-      spark-submit \
-        --master spark://spark-master:7077 \
-        --packages io.delta:delta-core_2.12:2.4.0,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0 \
-        --conf spark.sql.streaming.checkpointLocation.checkpointSchema=true \
+      /opt/spark/bin/spark-submit
+        --master spark://spark-master:7077
+        --jars /opt/spark/jars/delta-core_2.12-2.4.0.jar,/opt/spark/jars/delta-storage-2.4.0.jar,/opt/spark/jars/spark-sql-kafka-0-10_2.12-3.4.1.jar,/opt/spark/jars/spark-token-provider-kafka-0-10_2.12-3.4.0.jar,/opt/spark/jars/kafka-clients-3.4.0.jar,/opt/spark/jars/commons-pool2-2.11.1.jar
+        --conf spark.sql.streaming.checkpointLocation.checkpointSchema=true
+        --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension
+        --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog
         /opt/spark-jobs/jobs/bronze_ingestion.py
-      "
+      "]
     restart: unless-stopped
 
   spark-silver:
@@ -367,21 +356,24 @@ services:
     networks:
       - stock-etl-network
     depends_on:
-      spark-master:
-        condition: service_healthy
       spark-bronze:
         condition: service_started
-    command: >
-      bash -c "
-      echo 'Waiting for Bronze layer...' &&
-      sleep 40 &&
+    command: ["/bin/bash", "-c", "
+      echo 'Waiting for Bronze layer to initialize...' &&
+      sleep 60 &&
       echo 'Starting Silver Layer Cleaning...' &&
-      spark-submit
-      --master spark://spark-master:7077
-      --packages io.delta:delta-core_2.12:2.4.0
-      --conf spark.sql.streaming.checkpointLocation.checkpointSchema=true
-      /opt/spark-jobs/jobs/silver_cleaning.py
-      "
+      /opt/spark/bin/spark-submit
+        --master spark://spark-master:7077
+        --jars /opt/spark/jars/delta-core_2.12-2.4.0.jar,/opt/spark/jars/delta-storage-2.4.0.jar
+        --conf spark.sql.streaming.checkpointLocation.checkpointSchema=true
+        --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension
+        --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog
+        --conf spark.executor.instances=1
+        --conf spark.executor.cores=1
+        --conf spark.executor.memory=1g
+        --conf spark.shuffle.service.enabled=false
+        /opt/spark-jobs/jobs/silver_cleaning.py
+      "]
     restart: unless-stopped
 
   spark-gold:
@@ -400,21 +392,24 @@ services:
     networks:
       - stock-etl-network
     depends_on:
-      spark-master:
-        condition: service_healthy
       spark-silver:
         condition: service_started
-    command: >
-      bash -c "
-      echo 'Waiting for Silver layer...' &&
-      sleep 50 &&
+    command: ["/bin/bash", "-c", "
+      echo 'Waiting for Silver layer to initialize...' &&
+      sleep 60 &&
       echo 'Starting Gold Layer KPI Computation...' &&
-      spark-submit \
-        --master spark://spark-master:7077 \
-        --packages io.delta:delta-core_2.12:2.4.0 \
-        --conf spark.sql.streaming.checkpointLocation.checkpointSchema=true \
+      /opt/spark/bin/spark-submit
+        --master spark://spark-master:7077
+        --jars /opt/spark/jars/delta-core_2.12-2.4.0.jar,/opt/spark/jars/delta-storage-2.4.0.jar
+        --conf spark.sql.streaming.checkpointLocation.checkpointSchema=true
+        --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension
+        --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog
+        --conf spark.executor.instances=1
+        --conf spark.executor.cores=1
+        --conf spark.executor.memory=1g
+        --conf spark.shuffle.service.enabled=false
         /opt/spark-jobs/jobs/gold_kpis.py
-      "
+      "]
     restart: unless-stopped
 
   # ==========================================
@@ -429,16 +424,31 @@ services:
       - GF_INSTALL_PLUGINS=${GF_INSTALL_PLUGINS}
       - GF_USERS_ALLOW_SIGN_UP=false
       - GF_SERVER_HTTP_PORT=6010
+      - GF_DATABASE_TYPE=postgres
+      - GF_DATABASE_HOST=postgres-timescale:5432
+      - GF_DATABASE_NAME=grafana
+      - GF_DATABASE_USER=grafana
+      - GF_DATABASE_PASSWORD=grafana
+      - GF_DATABASE_SSL_MODE=disable
     volumes:
       - grafana-data:/var/lib/grafana
       - ./grafana/dashboards:/etc/grafana/provisioning/dashboards
       - ./grafana/datasources:/etc/grafana/provisioning/datasources
+      - ./scripts/ensure-grafana-db.sh:/ensure-grafana-db.sh
     ports:
       - "6010:6010"
     networks:
       - stock-etl-network
     depends_on:
-      - postgres-timescale
+      postgres-timescale:
+        condition: service_healthy
+    command: ["/bin/bash", "-c", "
+      # Wait for PostgreSQL and ensure database exists
+      /ensure-grafana-db.sh
+
+      # Start Grafana
+      /run.sh
+    "]
     healthcheck:
       test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:6010/api/health || exit 1"]
       interval: 10s

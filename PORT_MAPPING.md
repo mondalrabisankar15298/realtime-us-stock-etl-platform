@@ -7,7 +7,7 @@ All service ports have been remapped to the **7000-7999** range to avoid conflic
 | Service | Host Port | Container Port | Purpose | Access URL |
 |---------|-----------|----------------|---------|------------|
 | **Redpanda Kafka** | 7000 | 9092 | Kafka API endpoint | `localhost:7000` |
-| **Redpanda Pandaproxy** | 7001 | 28082 | Pandaproxy API | `localhost:7001` |
+| **Redpanda Pandaproxy** | 6001 | 28082 | Pandaproxy API | `localhost:6001` |
 | **Redpanda Admin** | 7002 | 9644 | Admin/metrics API | `localhost:7002` |
 | **Redpanda Console** | 7003 | **7003** ✅ | Web UI for Kafka topics | http://localhost:7003 |
 | **Spark Master UI** | 7004 | **7004** ✅ | Spark cluster web UI | http://localhost:7004 |
@@ -29,7 +29,7 @@ All service ports have been remapped to the **7000-7999** range to avoid conflic
 
 ### API Endpoints
 - **Kafka Broker**: `localhost:7000`
-- **Pandaproxy**: `localhost:7001`
+- **Pandaproxy**: `localhost:6001`
 - **Redpanda Admin**: `localhost:7002`
 
 ### Database Connections

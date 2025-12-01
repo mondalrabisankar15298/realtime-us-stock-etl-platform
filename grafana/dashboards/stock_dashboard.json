@@ -19,7 +19,7 @@
   "links": [],
   "panels": [
     {
-      "datasource": "StockData-Postgres",
+      "datasource": "StockData-TimescaleDB",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -117,7 +117,7 @@
       "type": "timeseries"
     },
     {
-      "datasource": "StockData-Postgres",
+      "datasource": "StockData-TimescaleDB",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -173,7 +173,7 @@
       "type": "gauge"
     },
     {
-      "datasource": "StockData-Postgres",
+      "datasource": "StockData-TimescaleDB",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -223,7 +223,7 @@
       "type": "piechart"
     },
     {
-      "datasource": "StockData-Postgres",
+      "datasource": "StockData-TimescaleDB",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -303,7 +303,7 @@
       "type": "timeseries"
     },
     {
-      "datasource": "StockData-Postgres",
+      "datasource": "StockData-TimescaleDB",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -382,7 +382,7 @@
       "type": "timeseries"
     },
     {
-      "datasource": "StockData-Postgres",
+      "datasource": "StockData-TimescaleDB",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -468,7 +468,7 @@
       "type": "table"
     },
     {
-      "datasource": "StockData-Postgres",
+      "datasource": "StockData-TimescaleDB",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -528,7 +528,7 @@
       "type": "gauge"
     },
     {
-      "datasource": "StockData-Postgres",
+      "datasource": "StockData-TimescaleDB",
       "fieldConfig": {
         "defaults": {
           "color": {
