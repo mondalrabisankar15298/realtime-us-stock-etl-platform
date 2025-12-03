@@ -1,10 +1,16 @@
 -- TimescaleDB Initialization Script
 -- Automatically executed when container first starts
+-- Note: The 'stockdata' database should already exist
+-- If it doesn't exist, create it manually or use the create-stockdata-db.sh script
 
--- Create databases
-CREATE DATABASE IF NOT EXISTS stockdata;
+-- Try to connect to stockdata, create if needed (using template1 connection)
+\c template1
 
--- Connect to stockdata database and enable TimescaleDB extension
+-- Create stockdata database if it doesn't exist (must be done from template1)
+SELECT 'CREATE DATABASE stockdata'
+WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'stockdata')\gexec
+
+-- Now connect to stockdata database
 \c stockdata;
 CREATE EXTENSION IF NOT EXISTS timescaledb;
 
@@ -154,15 +160,12 @@ SELECT add_continuous_aggregate_policy('gold_hourly',
 -- ==========================================
 
 -- Compress data older than 7 days
-SELECT add_compression_policy('gold_stocks', 
-    INTERVAL '7 days',
-    if_not_exists => TRUE
-);
-
-SELECT add_compression_policy('silver_stocks',
-    INTERVAL '7 days', 
-    if_not_exists => TRUE
-);
+-- Note: Compression requires columnstore to be enabled first
+-- Uncomment these after enabling columnstore:
+-- ALTER TABLE gold_stocks SET (timescaledb.compress, timescaledb.compress_segmentby = 'symbol');
+-- ALTER TABLE silver_stocks SET (timescaledb.compress, timescaledb.compress_segmentby = 'symbol');
+-- SELECT add_compression_policy('gold_stocks', INTERVAL '7 days', if_not_exists => TRUE);
+-- SELECT add_compression_policy('silver_stocks', INTERVAL '7 days', if_not_exists => TRUE);
 
 -- ==========================================
 -- Retention Policy (Optional - commented out)
@@ -193,10 +196,10 @@ ORDER BY symbol, ts DESC;
 CREATE OR REPLACE VIEW top_movers AS
 SELECT 
     symbol,
-    close as current_price,
+    price as current_price,
     daily_return,
     rsi_14,
-    volatility_5m,
+    volume,
     CASE 
         WHEN daily_return > 0 THEN 'gainer'
         WHEN daily_return < 0 THEN 'loser'
@@ -227,7 +230,9 @@ ORDER BY ts DESC;
 -- ==========================================
 
 -- Set recommended TimescaleDB settings
-ALTER DATABASE stockdata SET timescaledb.max_background_workers = 8;
+-- Note: timescaledb.max_background_workers requires server restart, so it's set in postgresql.conf
+-- This is handled by the TimescaleDB tuning script (001_timescaledb_tune.sh)
+-- ALTER DATABASE stockdata SET timescaledb.max_background_workers = 8;
 
 -- Grant all permissions to grafana user
 GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO grafana;

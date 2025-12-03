@@ -11,21 +11,23 @@ RUN apt-get update && apt-get install -y \
 # Verify existing Spark JARs are present
 RUN ls -la /opt/spark/jars/ | head -5 || echo "Warning: JARs directory check"
 
-# Download Delta Lake and Kafka dependencies (add to existing JARs)
+# Download Delta Lake, Kafka, and PostgreSQL dependencies (add to existing JARs)
 RUN cd /opt/spark/jars && \
-    wget -q https://repo1.maven.org/maven2/io/delta/delta-core_2.12/2.4.0/delta-core_2.12-2.4.0.jar && \
-    wget -q https://repo1.maven.org/maven2/io/delta/delta-storage/2.4.0/delta-storage-2.4.0.jar && \
-    wget -q https://repo1.maven.org/maven2/org/apache/spark/spark-sql-kafka-0-10_2.12/3.4.1/spark-sql-kafka-0-10_2.12-3.4.1.jar && \
-    wget -q https://repo1.maven.org/maven2/org/apache/spark/spark-token-provider-kafka-0-10_2.12/3.4.1/spark-token-provider-kafka-0-10_2.12-3.4.1.jar && \
-    wget -q https://repo1.maven.org/maven2/org/apache/kafka/kafka-clients/3.4.0/kafka-clients-3.4.0.jar && \
-    wget -q https://repo1.maven.org/maven2/org/apache/commons/commons-pool2/2.11.1/commons-pool2-2.11.1.jar && \
+    wget -O delta-core_2.12-2.4.0.jar https://repo1.maven.org/maven2/io/delta/delta-core_2.12/2.4.0/delta-core_2.12-2.4.0.jar && \
+    wget -O delta-storage-2.4.0.jar https://repo1.maven.org/maven2/io/delta/delta-storage/2.4.0/delta-storage-2.4.0.jar && \
+    wget -O postgresql-42.6.0.jar https://repo1.maven.org/maven2/org/postgresql/postgresql/42.6.0/postgresql-42.6.0.jar && \
+    wget -O spark-sql-kafka-0-10_2.12-3.4.1.jar https://repo1.maven.org/maven2/org/apache/spark/spark-sql-kafka-0-10_2.12/3.4.1/spark-sql-kafka-0-10_2.12-3.4.1.jar && \
+    wget -O spark-token-provider-kafka-0-10_2.12-3.4.0.jar https://repo1.maven.org/maven2/org/apache/spark/spark-token-provider-kafka-0-10_2.12/3.4.0/spark-token-provider-kafka-0-10_2.12-3.4.0.jar && \
+    wget -O kafka-clients-3.4.0.jar https://repo1.maven.org/maven2/org/apache/kafka/kafka-clients/3.4.0/kafka-clients-3.4.0.jar && \
+    wget -O commons-pool2-2.11.1.jar https://repo1.maven.org/maven2/org/apache/commons/commons-pool2/2.11.1/commons-pool2-2.11.1.jar && \
     chown -R spark:spark /opt/spark/jars
 
 # Install Python dependencies for Spark jobs
 RUN pip install --no-cache-dir \
     delta-spark==2.4.0 \
     pyspark==3.4.1 \
-    kafka-python==2.0.2
+    kafka-python==2.0.2 \
+    psycopg2-binary==2.9.9
 
 # Create directories
 RUN mkdir -p /opt/spark/delta_tables /opt/spark/checkpoints /opt/spark-jobs && \

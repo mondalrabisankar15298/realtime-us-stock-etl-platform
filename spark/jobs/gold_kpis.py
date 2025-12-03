@@ -80,31 +80,62 @@ def calculate_technical_indicators(df):
 
 def calculate_technical_indicators_batch(df):
     """
-    Calculate technical indicators in batch mode for the entire dataset
+    Calculate technical indicators in batch mode - PRESERVE TIME-SERIES STRUCTURE
+    Processes each (symbol, ts) record and adds technical indicators
     """
     from pyspark.sql.window import Window
 
-    # Calculate basic aggregations per symbol
-    gold_df = df.groupBy("symbol").agg(
-        F.avg("close").alias("avg_close"),
-        F.max("high").alias("max_high"),
-        F.min("low").alias("min_low"),
-        F.sum("volume").alias("total_volume"),
-        F.count("*").alias("record_count"),
-        F.last("close").alias("latest_close"),
-        F.stddev("close").alias("price_volatility")
+    # Define window specifications for time-series calculations
+    # Partition by symbol, order by timestamp
+    symbol_window = Window.partitionBy("symbol").orderBy("ts").rowsBetween(-4, 0)  # 5 rows (current + 4 previous)
+    symbol_window_20 = Window.partitionBy("symbol").orderBy("ts").rowsBetween(-19, 0)  # 20 rows
+    symbol_window_50 = Window.partitionBy("symbol").orderBy("ts").rowsBetween(-49, 0)  # 50 rows
+    
+    # Start with the original time-series data from silver
+    gold_df = df.select(
+        "symbol",
+        "ts",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume"
     )
-
-    # Add computed timestamp and placeholder columns for future technical indicators
+    
+    # Calculate Simple Moving Averages (SMA)
     gold_df = gold_df.withColumn(
-        "computed_at", F.current_timestamp()
+        "sma_5", F.avg("close").over(symbol_window)
     ).withColumn(
-        "sma_5", F.lit(None).cast("double")  # Placeholder for future calculations
+        "sma_20", F.avg("close").over(symbol_window_20)
     ).withColumn(
-        "sma_20", F.lit(None).cast("double")
+        "sma_50", F.avg("close").over(symbol_window_50)
+    )
+    
+    # Calculate price change and daily return
+    # Get previous close for return calculation
+    prev_close_window = Window.partitionBy("symbol").orderBy("ts").rowsBetween(Window.unboundedPreceding, Window.currentRow - 1)
+    gold_df = gold_df.withColumn(
+        "prev_close", F.lag("close", 1).over(Window.partitionBy("symbol").orderBy("ts"))
     ).withColumn(
-        "sma_50", F.lit(None).cast("double")
-    ).withColumn(
+        "price_change_pct", 
+        F.when(F.col("prev_close").isNotNull(), 
+               ((F.col("close") - F.col("prev_close")) / F.col("prev_close")) * 100)
+        .otherwise(None)
+    )
+    
+    # Calculate daily return (simplified - using price change)
+    gold_df = gold_df.withColumn(
+        "daily_return", F.col("price_change_pct")
+    )
+    
+    # Calculate volatility (rolling standard deviation of returns)
+    return_window = Window.partitionBy("symbol").orderBy("ts").rowsBetween(-4, 0)  # 5-minute window
+    gold_df = gold_df.withColumn(
+        "volatility_5m", F.stddev("price_change_pct").over(return_window)
+    )
+    
+    # Placeholder columns for future technical indicators (to be implemented)
+    gold_df = gold_df.withColumn(
         "ema_9", F.lit(None).cast("double")
     ).withColumn(
         "ema_21", F.lit(None).cast("double")
@@ -121,15 +152,14 @@ def calculate_technical_indicators_batch(df):
     ).withColumn(
         "atr_14", F.lit(None).cast("double")
     ).withColumn(
-        "daily_return", F.lit(None).cast("double")
-    ).withColumn(
-        "volatility_5m", F.col("price_volatility")  # Use calculated volatility
-    ).withColumn(
         "market_phase", F.lit("unknown")
     ).withColumn(
-        "price_change_pct", F.lit(None).cast("double")
+        "computed_at", F.current_timestamp()
     )
-
+    
+    # Drop helper column
+    gold_df = gold_df.drop("prev_close")
+    
     return gold_df
 
 
@@ -223,13 +253,16 @@ def upsert_to_gold(microBatchDF, batchId):
             print(f"Batch {batchId}: Skipping table creation - no data available")
 
 
-def process_gold_stream():
+def process_gold_stream(batch_mode=False):
     """
     Main Gold layer batch processing job
     - Reads from Silver Delta table
     - Calculates technical indicators and KPIs
     - Writes to Gold Delta table
     - Waits for Silver table to exist if needed
+    
+    Args:
+        batch_mode: If True, exit after initial processing (for Airflow/scheduled runs)
     """
     # Create Spark session
     spark = create_spark_session("GoldKPIs")
@@ -305,7 +338,12 @@ def process_gold_stream():
         print(f"Gold table location: {DELTA_PATH_GOLD}")
         print(f"Gold table contains {gold_df.count()} aggregated records")
 
-        # Keep the process alive and periodically reprocess
+        # If batch mode, exit after processing
+        if batch_mode:
+            print("\n✓ Gold layer batch processing completed (batch mode - exiting).")
+            return
+
+        # Keep the process alive and periodically reprocess (continuous mode)
         print("\nGold layer batch processing completed.")
         print("Job will run periodically to update Gold table with new Silver data...")
         print("Press Ctrl+C to stop...\n")
@@ -362,5 +400,7 @@ def process_gold_stream():
 
 
 if __name__ == "__main__":
-    process_gold_stream()
+    # Check for batch mode flag (for Airflow/scheduled runs)
+    batch_mode = "--batch" in sys.argv
+    process_gold_stream(batch_mode=batch_mode)
 

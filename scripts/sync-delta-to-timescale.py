@@ -8,12 +8,13 @@ Run this as a Spark job or Airflow DAG
 import sys
 from pyspark.sql import SparkSession
 from delta import configure_spark_with_delta_pip
+import psycopg2
 
 # Configuration
 DELTA_PATH_GOLD = "/opt/spark/delta_tables/gold"
 TIMESCALE_HOST = "postgres-timescale"
 TIMESCALE_PORT = "5432"
-TIMESCALE_DB = "grafana"
+TIMESCALE_DB = "stockdata"
 TIMESCALE_USER = "grafana"
 TIMESCALE_PASSWORD = "grafana"
 
@@ -74,10 +75,41 @@ def sync_gold_to_timescale(spark, batch_mode=False):
         "reWriteBatchedInserts": "true"
     }
     
-    # Write to TimescaleDB
-    # Note: This will append. For upserts, you'd need a custom foreachBatch function
+    # Write to TimescaleDB with UPSERT logic for batch mode
     print(f"Writing to TimescaleDB: {jdbc_url}")
-    
+
+    if batch_mode:
+        print("⚠️  BATCH MODE: This will UPSERT all historical data")
+        print("   Note: TimescaleDB doesn't support direct UPSERT via JDBC")
+        print("   Using APPEND mode - you may need to TRUNCATE table first for full sync")
+
+        # For batch mode, truncate and reload (since JDBC doesn't support UPSERT easily)
+        try:
+            # Create a temporary connection to truncate
+            import psycopg2
+            conn = psycopg2.connect(
+                host=TIMESCALE_HOST,
+                port=TIMESCALE_PORT,
+                database=TIMESCALE_DB,
+                user=TIMESCALE_USER,
+                password=TIMESCALE_PASSWORD
+            )
+            cursor = conn.cursor()
+
+            # Truncate table for full reload
+            cursor.execute("TRUNCATE TABLE gold_stocks;")
+            conn.commit()
+
+            print("✓ Truncated gold_stocks table for full reload")
+            cursor.close()
+            conn.close()
+
+        except Exception as e:
+            print(f"✗ Could not truncate table: {e}")
+            print("   Batch mode requires truncation. Aborting sync.")
+            return
+
+    # Write data
     df_gold.write \
         .mode("append") \
         .jdbc(url=jdbc_url, table="gold_stocks", properties=connection_properties)

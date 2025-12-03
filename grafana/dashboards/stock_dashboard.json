@@ -91,7 +91,7 @@
           "group": [],
           "metricColumn": "none",
           "rawQuery": true,
-          "rawSql": "SELECT\n  ts as time,\n  close as value,\n  symbol as metric\nFROM gold_stocks\nWHERE ts >= NOW() - INTERVAL '24 hours'\nORDER BY ts",
+          "rawSql": "SELECT\n  ts as time,\n  close as value,\n  symbol as metric\nFROM gold_stocks\nWHERE $__timeFilter(ts)\nORDER BY ts",
           "refId": "A",
           "select": [
             [
@@ -215,7 +215,7 @@
           "group": [],
           "metricColumn": "none",
           "rawQuery": true,
-          "rawSql": "SELECT\n  symbol,\n  SUM(volume) as total_volume\nFROM silver_stocks\nWHERE ts >= NOW() - INTERVAL '1 hour'\nGROUP BY symbol\nORDER BY total_volume DESC",
+          "rawSql": "SELECT\n  symbol,\n  SUM(volume) as total_volume\nFROM silver_stocks\nWHERE $__timeFilter(ts)\nGROUP BY symbol\nORDER BY total_volume DESC",
           "refId": "A"
         }
       ],
@@ -295,7 +295,7 @@
           "group": [],
           "metricColumn": "none",
           "rawQuery": true,
-          "rawSql": "SELECT\n  ts as time,\n  rsi_14 as value,\n  symbol as metric\nFROM gold_stocks\nWHERE ts >= NOW() - INTERVAL '6 hours'\nAND rsi_14 IS NOT NULL\nORDER BY ts",
+          "rawSql": "SELECT\n  ts as time,\n  rsi_14 as value,\n  symbol as metric\nFROM gold_stocks\nWHERE $__timeFilter(ts)\nAND rsi_14 IS NOT NULL\nORDER BY ts",
           "refId": "A"
         }
       ],
@@ -374,7 +374,7 @@
           "group": [],
           "metricColumn": "none",
           "rawQuery": true,
-          "rawSql": "SELECT\n  ts as time,\n  macd_histogram as value,\n  symbol as metric\nFROM gold_stocks\nWHERE ts >= NOW() - INTERVAL '6 hours'\nAND macd_histogram IS NOT NULL\nORDER BY ts",
+          "rawSql": "SELECT\n  ts as time,\n  macd_histogram as value,\n  symbol as metric\nFROM gold_stocks\nWHERE $__timeFilter(ts)\nAND macd_histogram IS NOT NULL\nORDER BY ts",
           "refId": "A"
         }
       ],
@@ -520,7 +520,7 @@
           "group": [],
           "metricColumn": "none",
           "rawQuery": true,
-          "rawSql": "SELECT COUNT(*) as dlq_messages\nFROM dlq_logs\nWHERE timestamp >= NOW() - INTERVAL '1 hour'",
+          "rawSql": "SELECT COUNT(*) as dlq_messages\nFROM dlq_logs\nWHERE $__timeFilter(timestamp)",
           "refId": "A"
         }
       ],
@@ -600,7 +600,7 @@
     "list": []
   },
   "time": {
-    "from": "now-6h",
+    "from": "now-30d",
     "to": "now"
   },
   "timepicker": {},

@@ -87,9 +87,15 @@ services:
     environment:
       - SPARK_MASTER_WEBUI_PORT=6004
       - SPARK_UI_PORT=4040
-      - SPARK_WORKER_MEMORY=12g
-      - SPARK_WORKER_CORES=8
+      - SPARK_WORKER_MEMORY=6g  # Optimized for 12GB total Docker limit
+      - SPARK_WORKER_CORES=6  # Increased for better parallelism (cores don't consume memory)
       - SPARK_SHUFFLE_SERVICE_ENABLED=false
+    deploy:
+      resources:
+        limits:
+          memory: 7g  # Worker memory (6g) + overhead (1g)
+        reservations:
+          memory: 6g
     ports:
       - "6004:6004"
       - "6005:7077"
@@ -184,7 +190,7 @@ services:
   # Airflow - Workflow Orchestration
   # ==========================================
   airflow-init:
-    image: apache/airflow:2.8.0-python3.11
+    image: custom-airflow:latest
     container_name: airflow-init
     environment:
       - AIRFLOW__CORE__EXECUTOR=${AIRFLOW__CORE__EXECUTOR}
@@ -215,7 +221,7 @@ services:
         echo "Airflow initialization complete"
 
   airflow-webserver:
-    image: apache/airflow:2.8.0-python3.11
+    image: custom-airflow:latest
     container_name: airflow-webserver
     environment:
       - AIRFLOW__CORE__EXECUTOR=${AIRFLOW__CORE__EXECUTOR}
@@ -248,7 +254,7 @@ services:
       retries: 5
 
   airflow-scheduler:
-    image: apache/airflow:2.8.0-python3.11
+    image: custom-airflow:latest
     container_name: airflow-scheduler
     environment:
       - AIRFLOW__CORE__EXECUTOR=${AIRFLOW__CORE__EXECUTOR}
@@ -309,6 +315,7 @@ services:
   # ==========================================
   spark-bronze:
     image: stock-etl-spark:latest
+    pull_policy: never
     container_name: spark-bronze-job
     environment:
       - SPARK_MASTER_URL=spark://spark-master:7077
@@ -322,6 +329,12 @@ services:
       - spark-checkpoints:/opt/spark/checkpoints
     networks:
       - stock-etl-network
+    deploy:
+      resources:
+        limits:
+          memory: 2g  # Reduced from 4g - Driver (512MB) + overhead
+        reservations:
+          memory: 1g
     depends_on:
       spark-master:
         condition: service_healthy
@@ -332,7 +345,7 @@ services:
       sleep 30 &&
       echo 'Starting Bronze Layer Ingestion...' &&
       /opt/spark/bin/spark-submit
-        --master local[*]
+        --master spark://spark-master:7077
         --jars /opt/spark/jars/delta-core_2.12-2.4.0.jar,/opt/spark/jars/delta-storage-2.4.0.jar,/opt/spark/jars/spark-sql-kafka-0-10_2.12-3.4.1.jar,/opt/spark/jars/spark-token-provider-kafka-0-10_2.12-3.4.0.jar,/opt/spark/jars/kafka-clients-3.4.0.jar,/opt/spark/jars/commons-pool2-2.11.1.jar
         --conf spark.sql.streaming.checkpointLocation.checkpointSchema=true
         --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension
@@ -343,13 +356,16 @@ services:
         --conf spark.dynamicAllocation.initialExecutors=1
         --conf spark.dynamicAllocation.executorIdleTimeout=30s
         --conf spark.executor.cores=2
-        --conf spark.executor.memory=2g
+        --conf spark.executor.memory=1g
+        --conf spark.driver.memory=512m
+        --conf spark.driver.cores=1
         /opt/spark-jobs/jobs/bronze_ingestion.py
       "]
     restart: unless-stopped
 
   spark-silver:
     image: stock-etl-spark:latest
+    pull_policy: never
     container_name: spark-silver-job
     environment:
       - SPARK_MASTER_URL=spark://spark-master:7077
@@ -363,6 +379,12 @@ services:
       - spark-checkpoints:/opt/spark/checkpoints
     networks:
       - stock-etl-network
+    deploy:
+      resources:
+        limits:
+          memory: 2g  # Reduced from 4g - Driver (512MB) + overhead
+        reservations:
+          memory: 1g
     depends_on:
       spark-bronze:
         condition: service_started
@@ -371,48 +393,19 @@ services:
       sleep 60 &&
       echo 'Starting Silver Layer Cleaning...' &&
       /opt/spark/bin/spark-submit
-        --master local[*]
+        --master spark://spark-master:7077
         --jars /opt/spark/jars/delta-core_2.12-2.4.0.jar,/opt/spark/jars/delta-storage-2.4.0.jar
         --conf spark.sql.streaming.checkpointLocation.checkpointSchema=true
         --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension
         --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog
-        /opt/spark-jobs/jobs/silver_cleaning.py
-      "]
-    restart: unless-stopped
-
-  spark-gold:
-    image: stock-etl-spark:latest
-    container_name: spark-gold-job
-    environment:
-      - SPARK_MASTER_URL=spark://spark-master:7077
-      - SPARK_RPC_AUTHENTICATION_ENABLED=no
-      - SPARK_RPC_ENCRYPTION_ENABLED=no
-      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
-      - SPARK_SSL_ENABLED=no
-    volumes:
-      - ./spark:/opt/spark-jobs
-      - spark-delta-tables:/opt/spark/delta_tables
-      - spark-checkpoints:/opt/spark/checkpoints
-    networks:
-      - stock-etl-network
-    depends_on:
-      spark-silver:
-        condition: service_started
-    command: ["/bin/bash", "-c", "
-      echo 'Waiting for Silver layer to initialize...' &&
-      sleep 60 &&
-      echo 'Starting Gold Layer KPI Computation...' &&
-      /opt/spark/bin/spark-submit
-        --master local[*]
-        --jars /opt/spark/jars/delta-core_2.12-2.4.0.jar,/opt/spark/jars/delta-storage-2.4.0.jar
-        --conf spark.sql.streaming.checkpointLocation.checkpointSchema=true
-        --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension
-        --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog
-        --conf spark.executor.instances=1
+        --conf spark.dynamicAllocation.enabled=true
+        --conf spark.dynamicAllocation.minExecutors=1
+        --conf spark.dynamicAllocation.maxExecutors=2
+        --conf spark.executor.memory=1g
         --conf spark.executor.cores=2
-        --conf spark.executor.memory=2g
-        --conf spark.shuffle.service.enabled=false
-        /opt/spark-jobs/jobs/gold_kpis.py
+        --conf spark.driver.memory=512m
+        --conf spark.driver.cores=1
+        /opt/spark-jobs/jobs/silver_cleaning.py
       "]
     restart: unless-stopped
 
