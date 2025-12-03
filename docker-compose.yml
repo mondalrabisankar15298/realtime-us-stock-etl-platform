@@ -190,6 +190,9 @@ services:
   # Airflow - Workflow Orchestration
   # ==========================================
   airflow-init:
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
     image: custom-airflow:latest
     container_name: airflow-init
     environment:
