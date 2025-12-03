@@ -1,6 +1,6 @@
 -- Grafana Database Initialization
--- Since POSTGRES_DB=grafana, we're already in the grafana database
--- Just create the user and set permissions
+-- Connect to grafana database first (since previous script may have switched databases)
+\c grafana;
 
 -- Create grafana user if it doesn't exist
 DO $$
