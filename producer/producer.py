@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Real-Time Stock Data Producer (fixed & production-ready)
-- Fetches 1-minute OHLCV data from Yahoo Finance (direct API calls)
+Real-Time Stock Data Producer (no Kafka reset)
+- Fetches OHLCV from Yahoo Finance
 - Publishes to Redpanda/Kafka with retries and DLQ
-- Robust per-ticker state handling (last-success timestamp + backfill_done flag)
-- Signal-safe shutdown, polite sleeps, and backfill control via env
+- Per-ticker state: last_timestamp + backfill_done
+- Watermarks persisted to a separate file (watermarks.json)
+- If FORCE_BACKFILL true at startup: reset persisted backfill flags and delete watermark file.
 """
 
 import json
@@ -51,6 +52,7 @@ PRODUCER_RETRY_DELAY = int(os.getenv("PRODUCER_RETRY_DELAY", "5"))
 POLITE_SLEEP_BETWEEN_TICKERS = float(os.getenv("POLITE_SLEEP_BETWEEN_TICKERS", "0.25"))
 
 STATE_FILE_PATH = Path(os.getenv("STATE_FILE_PATH", "/app/state/last_fetch.json"))
+WATERMARK_FILE_PATH = Path(os.getenv("WATERMARK_FILE_PATH", "/app/state/watermarks.json"))
 LOG_FILE_PATH = Path(os.getenv("LOG_FILE_PATH", "/app/logs/producer.log"))
 
 FORCE_BACKFILL = os.getenv("FORCE_BACKFILL", "false").lower() in ("1", "true", "yes")
@@ -89,7 +91,9 @@ logger.info("Producer configuration", extra={
     "interval_seconds": PRODUCER_INTERVAL_SECONDS,
     "backfill_days": BACKFILL_DAYS,
     "force_backfill": FORCE_BACKFILL,
-    "run_once": RUN_ONCE
+    "run_once": RUN_ONCE,
+    "state_file": str(STATE_FILE_PATH),
+    "watermark_file": str(WATERMARK_FILE_PATH),
 })
 
 # ==========================================
@@ -109,11 +113,6 @@ signal.signal(signal.SIGTERM, _signal_handler)
 
 # ==========================================
 # State Management (per-ticker dict with last_timestamp & backfill_done)
-# Example state structure:
-# {
-#   "AAPL": {"last_timestamp": "2025-11-30T14:59:00+00:00", "backfill_done": true},
-#   "MSFT": {"last_timestamp": "2025-11-30T14:59:00+00:00", "backfill_done": false}
-# }
 # ==========================================
 class StateManager:
     def __init__(self, state_file: Path):
@@ -126,13 +125,11 @@ class StateManager:
             try:
                 with open(self.state_file, "r") as f:
                     s = json.load(f)
-                    # Backwards compatibility: if value is string -> convert to dict
                     normalized = {}
                     for k, v in s.items():
                         if isinstance(v, str):
                             normalized[k] = {"last_timestamp": v, "backfill_done": False}
                         elif isinstance(v, dict):
-                            # ensure keys exist
                             normalized[k] = {
                                 "last_timestamp": v.get("last_timestamp"),
                                 "backfill_done": bool(v.get("backfill_done", False)),
@@ -163,7 +160,6 @@ class StateManager:
             return None
         try:
             dt = datetime.fromisoformat(ts_str)
-            # ensure tz-aware
             if dt.tzinfo is None:
                 dt = UTC_TZ.localize(dt)
             else:
@@ -174,7 +170,6 @@ class StateManager:
             return None
 
     def update_timestamp(self, ticker: str, timestamp: datetime):
-        # normalize to UTC and save ISO
         if timestamp.tzinfo is None:
             timestamp = UTC_TZ.localize(timestamp)
         else:
@@ -201,27 +196,74 @@ class StateManager:
 
 
 # ==========================================
+# Watermark Manager (separate persisted file)
+# ==========================================
+class WatermarkManager:
+    def __init__(self, watermark_file: Path):
+        self.watermark_file = watermark_file
+        self.watermark_file.parent.mkdir(parents=True, exist_ok=True)
+        self.watermarks = self._load()
+
+    def _load(self) -> Dict[str, Optional[str]]:
+        if self.watermark_file.exists():
+            try:
+                with open(self.watermark_file, "r") as f:
+                    data = json.load(f)
+                    logger.info("Loaded watermark file", extra={"count": len(data)})
+                    return data
+            except Exception as e:
+                logger.warning(f"Failed to load watermark file: {e}")
+                return {}
+        return {}
+
+    def _save(self):
+        try:
+            with open(self.watermark_file, "w") as f:
+                json.dump(self.watermarks, f, indent=2)
+            logger.debug("Watermark file saved")
+        except Exception as e:
+            logger.error(f"Failed to save watermark file: {e}")
+
+    def update(self, ticker: str, ts: datetime):
+        if ts.tzinfo is None:
+            ts = UTC_TZ.localize(ts)
+        else:
+            ts = ts.astimezone(UTC_TZ)
+        self.watermarks[ticker] = ts.isoformat()
+        self._save()
+        logger.info("Watermark updated", extra={"ticker": ticker, "watermark": ts.isoformat()})
+
+    def delete_file(self):
+        try:
+            if self.watermark_file.exists():
+                self.watermark_file.unlink()
+                self.watermarks = {}
+                logger.info("Watermark file deleted due to FORCE_BACKFILL")
+        except Exception as e:
+            logger.warning(f"Failed to delete watermark file: {e}")
+
+
+# ==========================================
 # Stock Producer
 # ==========================================
 class StockDataProducer:
     def __init__(self):
         self.state_manager = StateManager(STATE_FILE_PATH)
+        self.watermark_manager = WatermarkManager(WATERMARK_FILE_PATH)
         self.producer = self._create_producer()
-        # Keep a mutable one-shot override so we can control if necessary within instance
         self._force_backfill_env = FORCE_BACKFILL
-
-        # --- ADDED: session guard so each ticker backfill is attempted only once per running process
         self._session_backfilled = set()
 
-        # --- ADDED: if FORCE_BACKFILL true at startup, reset persisted backfill_done=False for all tickers
-        # so the process will attempt backfill for each ticker once.
+        # If FORCE_BACKFILL true at startup: reset persisted backfill_done flags (so backfill runs per-ticker)
+        # Note: Comprehensive cleanup (Kafka, Delta tables, checkpoints, TimescaleDB, Airflow) is now handled
+        # by the cleanup-init container before producer starts.
         if self._force_backfill_env:
             try:
-                logger.info("FORCE_BACKFILL true at startup - resetting persisted backfill_done for all tickers", extra={"tickers": STOCK_TICKERS})
+                logger.info("FORCE_BACKFILL true at startup - resetting backfill flags")
                 for t in STOCK_TICKERS:
                     self.state_manager.mark_backfill_done(t.strip(), False)
             except Exception as e:
-                logger.warning(f"Failed to reset persisted backfill flags at startup: {e}")
+                logger.warning(f"Failed to reset backfill flags: {e}")
 
     def _create_producer(self) -> KafkaProducer:
         attempts = 10
@@ -244,66 +286,38 @@ class StockDataProducer:
         logger.critical("Unable to connect to Kafka after multiple attempts")
         raise RuntimeError("Kafka connection failed")
 
-    # -----------------------------
-    # Interval chooser (moved into producer so self._choose_interval_for_range exists)
-    # -----------------------------
     def _choose_interval_for_range(self, days: float) -> str:
-        """
-        Pick a Yahoo-friendly interval for a requested range length in days.
-        The mapping is empirical — adjusts which interval to try first.
-        Returns interval string like "1m", "2m", "5m", "15m", "1h", "1d".
-        """
-        # Conservative mapping based on Yahoo tolerance (empirical)
         if days <= 7:
             return "1m"
         if days <= 30:
-            # 2m sometimes flaky for large-ish ranges; prefer 5m for stability for ~30 days
             return "5m"
         if days <= 90:
-            # 5m or 15m can work; choose 15m for ~month+ windows to reduce size
             return "15m"
         if days <= 365:
             return "1h"
         return "1d"
 
-    # -----------------------------
-    # Public fetch / publish helpers
-    # -----------------------------
     def fetch_stock_data(self, ticker: str) -> Tuple[List[Dict], bool]:
-        """
-        Decide incremental vs backfill for this ticker.
-        Returns (messages, performed_backfill_bool)
-        performed_backfill_bool indicates whether this call executed backfill for the ticker.
-        """
         last_ts = self.state_manager.get_last_timestamp(ticker)
         backfill_done_flag = self.state_manager.backfill_done(ticker)
 
-        # --- ADDED: if we've already attempted backfill for this ticker in this session, skip re-attempt
         if ticker in self._session_backfilled:
             logger.debug("Skipping backfill in this session (already attempted)", extra={"ticker": ticker})
-            # if we have a last timestamp, proceed with incremental; otherwise return empty (avoid repeated backfill)
             if last_ts:
                 return self._fetch_incremental(ticker, last_ts), False
             else:
                 return [], False
 
-        # CASES per-ticker:
-        # 1) FORCE_BACKFILL (env True) and backfill_done is False -> perform backfill (regardless of last_ts)
-        # 2) FORCE_BACKFILL False and last_ts is None -> perform backfill
-        # 3) else -> incremental
         if self._force_backfill_env and not backfill_done_flag:
             logger.info("FORCE_BACKFILL active for ticker (will backfill once)", extra={"ticker": ticker})
-            # mark attempted for this session so we don't repeat within same process
             self._session_backfilled.add(ticker)
             msgs = self._fetch_backfill_chunked(ticker)
             return msgs, True
         if not self._force_backfill_env and last_ts is None:
             logger.info("No state found for ticker (will backfill)", extra={"ticker": ticker})
-            # mark attempted for this session so we don't repeat within same process
             self._session_backfilled.add(ticker)
             msgs = self._fetch_backfill_chunked(ticker)
             return msgs, True
-        # Otherwise use incremental fetch based on last_ts
         return self._fetch_incremental(ticker, last_ts), False
 
     @retry(
@@ -312,17 +326,11 @@ class StockDataProducer:
         retry=retry_if_exception_type(Exception),
     )
     def _fetch_incremental(self, ticker: str, last_timestamp: datetime) -> List[Dict]:
-        """
-        Fetch newer data since last_timestamp.
-        Uses direct Yahoo API for precise windows.
-        """
         import requests
         import pandas as pd
 
         now = datetime.now(UTC_TZ)
-        # Missing or future states handled
         if last_timestamp is None:
-            # defensive - treat as tiny backfill (shouldn't get here)
             logger.warning("Incremental called with no last_timestamp; performing short backfill", extra={"ticker": ticker})
             start = now - timedelta(minutes=10)
             return self._fetch_direct_yahoo_finance_chunk(ticker, start, now, "1m")
@@ -333,28 +341,21 @@ class StockDataProducer:
             return []
 
         gap_seconds = (now - last_timestamp).total_seconds()
-        # If gap less than 60s, nothing to fetch
         if gap_seconds < 60:
             logger.debug(f"No new data for {ticker}, gap {gap_seconds:.1f}s")
             return []
 
-        # If the gap is large, perform catchup chunks (method covers that)
         if gap_seconds > (2.1 * 24 * 3600):
             return self._fetch_direct_yahoo_finance_incremental_catchup(ticker, last_timestamp)
 
-        # Small gap: fetch 1m data from last_timestamp -> now
-        start = last_timestamp - timedelta(seconds=10)  # safety margin
+        start = last_timestamp - timedelta(seconds=10)
         end = now
         return self._fetch_direct_yahoo_finance_chunk(ticker, start, end, "1m")
 
-    # -----------------------------
-    # Yahoo direct helpers (unchanged)
-    # -----------------------------
     def _fetch_direct_yahoo_finance_chunk(self, ticker: str, start_date: datetime, end_date: datetime, interval: str) -> List[Dict]:
         import requests
         import pandas as pd
 
-        # Ensure timezone-aware UTC
         if start_date.tzinfo is None:
             start_date = UTC_TZ.localize(start_date)
         else:
@@ -401,7 +402,6 @@ class StockDataProducer:
                 o, h, l, c, v = open_prices[i], high_prices[i], low_prices[i], close_prices[i], volumes[i]
                 if o is None or h is None or l is None or c is None:
                     continue
-                # Yahoo timestamps are epoch seconds in UTC
                 ts_utc = pd.to_datetime(timestamps[i], unit="s", utc=True)
                 aligned.append({
                     "timestamp": ts_utc,
@@ -448,20 +448,15 @@ class StockDataProducer:
 
         return messages
 
-    # -----------------------------
-    # Backfill strategy (first-run / per-ticker)
-    # -----------------------------
     def _fetch_backfill_chunked(self, ticker: str) -> List[Dict]:
         all_messages = []
         now_utc = datetime.now(UTC_TZ)
         end_date = now_utc
 
-        # windows (days_back, interval, chunk_days)
         windows = [
             (7, "1m", 3),
             (30, "2m", 7),
             (BACKFILL_DAYS, "5m", 30),
-            # (BACKFILL_DAYS, "1m", 1),
         ]
 
         for days_back, interval, chunk_days in windows:
@@ -473,24 +468,6 @@ class StockDataProducer:
                 msgs = self._fetch_chunk_with_dlq(ticker, s, e, interval)
                 all_messages.extend(msgs)
                 time.sleep(0.5 + (0.5 * (time.time() % 1)))
-            # for s, e in chunks:
-            #     logger.info("Backfill chunk start", extra={
-            #         "ticker": ticker,
-            #         "start": s.isoformat(),
-            #         "end": e.isoformat(),
-            #         "interval": interval,
-            #         "range_days": (e - s).total_seconds() / (24*3600)
-            #     })
-            #     msgs = self._fetch_chunk_with_dlq(ticker, s, e, interval)
-            #     logger.info("Backfill chunk done", extra={
-            #         "ticker": ticker,
-            #         "start": s.isoformat(),
-            #         "end": e.isoformat(),
-            #         "interval": interval,
-            #         "bars": len(msgs)
-            #     })
-            #     all_messages.extend(msgs)
-            #     time.sleep(0.5 + (0.5 * (time.time() % 1)))
 
         logger.info("Backfill finished", extra={"ticker": ticker, "bars": len(all_messages)})
         return all_messages
@@ -505,21 +482,11 @@ class StockDataProducer:
         return chunks
 
     def _fetch_chunk_with_dlq(self, ticker: str, start_date: datetime, end_date: datetime, interval: str) -> List[Dict]:
-        """
-        Try fetching the chunk; choose a more likely-to-succeed interval up-front based on range.
-        Keeps fallback and DLQ behaviour.
-        """
         import requests
 
-        # compute range in days
         range_days = (end_date - start_date).total_seconds() / (24 * 3600)
-
-        # choose a better-first interval based on requested range
         chosen_interval = self._choose_interval_for_range(range_days)
 
-        # If the caller explicitly requested a very fine interval and range_days is small,
-        # keep the caller interval; otherwise prefer chosen_interval.
-        # (This preserves backward compatibility: caller can still override by passing interval.)
         try_first_interval = interval if (interval in ("1m","2m","5m","15m","30m","1h","1d") and
                                           ( (interval == "1m" and range_days <= 7) or
                                             (interval == "2m" and range_days <= 60) or
@@ -530,7 +497,6 @@ class StockDataProducer:
                                           )
                                          ) else chosen_interval
 
-        # Now try fetch with that first-good-interval, then fallbacks (preserve original logic)
         attempts = 3
         try:
             for attempt in range(attempts):
@@ -539,7 +505,6 @@ class StockDataProducer:
                 except requests.exceptions.HTTPError as e:
                     status = getattr(e.response, "status_code", None)
                     if status == 422:
-                        # break to fallback logic below
                         break
                     if attempt < attempts - 1:
                         time.sleep(2 ** attempt)
@@ -555,18 +520,14 @@ class StockDataProducer:
                         self._publish_backfill_dlq(ticker, start_date, end_date, try_first_interval, str(e))
                         return []
         except Exception:
-            # defensive
             pass
 
-        # fallback intervals (coarser) to try after first attempt fails
         fallback_intervals = ["2m", "5m", "15m", "1h", "1d"]
-        # ensure chosen interval isn't tried twice
         if try_first_interval in fallback_intervals:
             fallback_order = [iv for iv in fallback_intervals if iv != try_first_interval]
         else:
             fallback_order = [iv for iv in fallback_intervals]
 
-        # Try fallbacks
         for iv in fallback_order:
             try:
                 return self._fetch_direct_yahoo_finance_chunk(ticker, start_date, end_date, iv)
@@ -578,7 +539,6 @@ class StockDataProducer:
             except Exception:
                 continue
 
-        # As last resort, split into 1-day sub-chunks and try again (coarser intervals)
         sub_messages = []
         cur = start_date
         sub_chunk_days = 1
@@ -586,7 +546,6 @@ class StockDataProducer:
             nxt = min(cur + timedelta(days=sub_chunk_days), end_date)
             got = []
             tried_ok = False
-            # try original-chosen and fallbacks for tiny chunk
             for iv in [try_first_interval] + fallback_order:
                 try:
                     got = self._fetch_direct_yahoo_finance_chunk(ticker, cur, nxt, iv)
@@ -597,7 +556,6 @@ class StockDataProducer:
                 except Exception:
                     continue
             if not tried_ok:
-                # unable to fetch this tiny sub-chunk -> DLQ and continue
                 self._publish_backfill_dlq(ticker, cur, nxt, try_first_interval, "failed all fallbacks for tiny chunk")
             cur = nxt
 
@@ -619,9 +577,6 @@ class StockDataProducer:
         except Exception as exc:
             logger.error("Failed to publish backfill DLQ", extra={"error": str(exc)})
 
-    # -----------------------------
-    # Data processing & publishing
-    # -----------------------------
     def _process_dataframe(self, ticker: str, df, fetch_type: str, source_interval: str, window_start=None, window_end=None) -> List[Dict]:
         messages = []
         latest_ts = None
@@ -679,28 +634,15 @@ class StockDataProducer:
         except Exception as e:
             logger.error("Failed to publish to DLQ", extra={"error": str(e)})
 
-    # -----------------------------
-    # Worker per ticker
-    # -----------------------------
     def process_ticker(self, ticker: str):
-        """
-        Fetch & publish pipeline for a single ticker.
-        Ensures state advances only to latest successful published message.
-        """
         try:
             ticker = ticker.strip()
-            # Decide per-ticker backfill/incremental and whether we performed backfill
             messages, performed_backfill = self.fetch_stock_data(ticker)
 
             if not messages:
                 logger.info("No messages fetched", extra={"ticker": ticker, "performed_backfill": performed_backfill})
-                # If we performed backfill but got nothing, don't mark backfill_done; will retry next round
                 return
 
-            # Only filter messages > last_state when this is an incremental run.
-            # If we are performing backfill (performed_backfill == True) we intentionally ignore persisted last_state,
-            # because the user requested FORCE_BACKFILL (or initial missing-state backfill) to fetch historical data
-            # even if last_timestamp exists.
             last_state_ts = self.state_manager.get_last_timestamp(ticker)
             if not performed_backfill and last_state_ts:
                 filtered = [m for m in messages if datetime.fromtimestamp(m["timestamp"], tz=UTC_TZ) > last_state_ts]
@@ -724,16 +666,15 @@ class StockDataProducer:
                 else:
                     failed.append(msg)
 
-            # Update state: prefer latest_success_ts; if none and we were backfilling, do not advance state
             if latest_success_ts:
                 self.state_manager.update_timestamp(ticker, latest_success_ts)
-                # If we performed backfill (either forced or initial), mark this ticker as done
                 if performed_backfill:
                     self.state_manager.mark_backfill_done(ticker, True)
+                # update watermark file as well
+                self.watermark_manager.update(ticker, latest_success_ts)
             else:
                 logger.warning("No successful publishes for ticker; state not advanced", extra={"ticker": ticker})
 
-            # Send failed messages to DLQ
             for fm in failed:
                 self.publish_to_dlq(ticker, "publish_failed", fm)
 
@@ -742,10 +683,6 @@ class StockDataProducer:
             logger.exception("Failed to process ticker", extra={"ticker": ticker, "error": str(e)})
             self.publish_to_dlq(ticker, f"processing_exception: {e}")
 
-
-    # -----------------------------
-    # Main loop
-    # -----------------------------
     def run(self):
         logger.info("Producer started main loop")
         first_round = True
@@ -756,15 +693,11 @@ class StockDataProducer:
             is_weekday = now_ny.weekday() < 5
             is_market_hours = 9 <= now_ny.hour < 17
 
-            # Determine if any ticker lacks state/backfill_done (per-ticker)
             needs_backfill = any(
                 (not self.state_manager.get_last_timestamp(t.strip())) for t in STOCK_TICKERS
             )
 
-            # We run if market is open OR there are tickers needing backfill OR the env force flag is set
             should_run = (is_weekday and is_market_hours) or needs_backfill or self._force_backfill_env
-
-            # Mode is for logging only; actual per-ticker behavior is per-state & performed_backfill
             mode = "backfill" if (needs_backfill or self._force_backfill_env) else "realtime"
             if should_run:
                 logger.info("Starting processing round", extra={"mode": mode, "tickers": len(STOCK_TICKERS)})
@@ -772,15 +705,10 @@ class StockDataProducer:
                     if SHUTDOWN:
                         break
                     self.process_ticker(t)
-                    # polite sleep between tickers
                     time.sleep(POLITE_SLEEP_BETWEEN_TICKERS)
                 logger.info("Processing round complete")
-                # If FORCE_BACKFILL env was set and we want it to apply only once per-instance, disable it after first round.
-                # User asked for behavior: if FORCE_BACKFILL true, do backfill once then incremental.
-                # We respect that by turning off the instance flag after the first full round where tickers had
-                # an opportunity to perform backfill. This prevents repeated backfill across rounds within the same container.
                 if self._force_backfill_env and first_round:
-                    logger.info("Disabling instance FORCE_BACKFILL after first round (backfills performed per-ticker)", extra={})
+                    logger.info("Disabling instance FORCE_BACKFILL after first round (backfills performed per-ticker)")
                     self._force_backfill_env = False
             else:
                 logger.info("Skipping fetch (market closed and no backfill needed)", extra={"weekday": is_weekday, "market_hours": is_market_hours})
@@ -797,7 +725,6 @@ class StockDataProducer:
 
             first_round = False
 
-        # Cleanup
         try:
             self.producer.flush()
             self.producer.close()

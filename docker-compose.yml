@@ -277,12 +277,43 @@ services:
         condition: service_completed_successfully
       postgres-airflow:
         condition: service_healthy
+      cleanup-init:
+        condition: service_completed_successfully
     command: scheduler
     healthcheck:
       test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
       interval: 10s
       timeout: 10s
       retries: 5
+
+  # ==========================================
+  # Cleanup Init - FORCE_BACKFILL Data Cleanup
+  # ==========================================
+  cleanup-init:
+    image: docker.redpanda.com/redpandadata/redpanda:v23.3.3
+    container_name: cleanup-init
+    entrypoint: ["/bin/bash"]
+    user: root  # Run as root to handle volume permissions
+    environment:
+      - FORCE_BACKFILL=${FORCE_BACKFILL}
+      - POSTGRES_GRAFANA_USER=${POSTGRES_GRAFANA_USER}
+      - POSTGRES_GRAFANA_PASSWORD=${POSTGRES_GRAFANA_PASSWORD}
+    volumes:
+      - ./scripts:/scripts
+      - ./producer/state:/app/state
+      - spark-delta-tables:/opt/spark/delta_tables
+      - spark-checkpoints:/opt/spark/checkpoints
+    networks:
+      - stock-etl-network
+    depends_on:
+      redpanda:
+        condition: service_healthy  # Wait for Redpanda to be healthy
+      postgres-timescale:
+        condition: service_healthy  # Wait for TimescaleDB to be healthy
+      postgres-airflow:
+        condition: service_healthy  # Wait for Airflow DB to be healthy
+    command: ["/scripts/cleanup-on-backfill.sh"]
+    restart: "no"
 
   # ==========================================
   # Producer - Stock Data Ingestion
@@ -304,12 +335,15 @@ services:
       - BACKFILL_DAYS=${BACKFILL_DAYS}
       - FORCE_BACKFILL=${FORCE_BACKFILL}
       - TZ=${TZ}
+      - WM_PATH=/app/state/watermarks.json
     volumes:
       - ./producer/state:/app/state
       - ./producer/logs:/app/logs
     networks:
       - stock-etl-network
     depends_on:
+      cleanup-init:
+        condition: service_completed_successfully
       redpanda:
         condition: service_healthy
     restart: unless-stopped
@@ -344,6 +378,8 @@ services:
         condition: service_healthy
       redpanda:
         condition: service_healthy
+      cleanup-init:
+        condition: service_completed_successfully
     command: ["/bin/bash", "-c", "
       echo 'Waiting for Spark master...' &&
       sleep 30 &&
@@ -392,6 +428,8 @@ services:
     depends_on:
       spark-bronze:
         condition: service_started
+      cleanup-init:
+        condition: service_completed_successfully
     command: ["/bin/bash", "-c", "
       echo 'Waiting for Bronze layer to initialize...' &&
       sleep 60 &&
