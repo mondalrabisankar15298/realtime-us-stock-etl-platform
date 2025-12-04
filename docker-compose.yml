@@ -302,6 +302,7 @@ services:
       - PRODUCER_MAX_RETRIES=${PRODUCER_MAX_RETRIES}
       - PRODUCER_RETRY_DELAY=${PRODUCER_RETRY_DELAY}
       - BACKFILL_DAYS=${BACKFILL_DAYS}
+      - FORCE_BACKFILL=${FORCE_BACKFILL}
       - TZ=${TZ}
     volumes:
       - ./producer/state:/app/state
