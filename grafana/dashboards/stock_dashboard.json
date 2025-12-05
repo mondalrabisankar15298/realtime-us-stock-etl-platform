@@ -63,7 +63,8 @@
               }
             ]
           },
-          "unit": "currencyUSD"
+          "unit": "none",
+          "decimals": 2
         },
         "overrides": []
       },
@@ -137,7 +138,8 @@
               }
             ]
           },
-          "unit": "percent"
+          "unit": "percent",
+          "decimals": 2
         },
         "overrides": []
       },
@@ -267,7 +269,8 @@
               }
             ]
           },
-          "unit": "short"
+          "unit": "short",
+          "decimals": 2
         },
         "overrides": []
       },
@@ -346,7 +349,8 @@
                 "value": null
               }
             ]
-          }
+          },
+          "decimals": 4
         },
         "overrides": []
       },
@@ -407,12 +411,32 @@
           {
             "matcher": {
               "id": "byName",
+              "options": "price"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "none"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
               "options": "daily_return"
             },
             "properties": [
               {
                 "id": "custom.displayMode",
                 "value": "color-background"
+              },
+              {
+                "id": "decimals",
+                "value": 2
               },
               {
                 "id": "thresholds",
@@ -433,6 +457,30 @@
                     }
                   ]
                 }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "volatility_5m"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 4
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "rsi_14"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 2
               }
             ]
           }

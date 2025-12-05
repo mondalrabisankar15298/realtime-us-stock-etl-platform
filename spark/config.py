@@ -51,6 +51,9 @@ def get_spark_config():
         "spark.databricks.delta.schema.autoMerge.enabled": "true",
         "spark.sql.adaptive.enabled": "true",
         "spark.sql.adaptive.coalescePartitions.enabled": "true",
+        # Critical: Set timezone to UTC to ensure consistent timestamp handling
+        # This prevents timezone-dependent conversions that cause duplicate/misaligned timestamps
+        "spark.sql.session.timeZone": "UTC",
     }
 
 

@@ -1,305 +1,261 @@
 #!/usr/bin/env python3
 """
-Bronze ingestion (minimal logs)
+Bronze ingestion job: read raw JSON messages from Kafka, deduplicate & upsert into a Delta bronze table.
 
-- Suppresses verbose Spark INFO logs (sets Spark log level to WARN).
-- Prints compact per-batch summary + "Bronze written" only when there are input rows,
-  or once every IDLE_PRINT_EVERY idle batches (configurable).
-- Uses foreachBatch to write to Delta (append, mergeSchema).
+How it prevents duplicates:
+  - Each micro-batch we:
+    1) parse JSON value, normalize/convert types
+    2) compute event timestamp (ts_utc) from epoch seconds in message["timestamp"]
+    3) apply event-time watermark (configurable)
+    4) within the micro-batch, deduplicate by (symbol, ts_utc, source_interval) keeping the row with newest ingested_at
+    5) MERGE into the Delta bronze table on the same key (symbol, ts_utc, source_interval).
+       When matched -> update (to overwrite older duplicate). When not matched -> insert.
+       
+**TIMEZONE FIX**: Uses direct epoch-to-timestamp cast to ensure UTC consistency regardless of server timezone.
 """
 
-import sys
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+from delta.tables import DeltaTable
 import os
-import time
-import traceback
-from pathlib import Path
-from typing import Dict
+import json
 
-from pyspark.sql import SparkSession, functions as F
-from pyspark.sql.types import (
-    StructType, StructField, StringType, LongType, DoubleType
+# === Configuration (from env) ===
+KAFKA_BOOTSTRAP = os.getenv("REDPANDA_BROKER", "redpanda:9092")
+KAFKA_TOPIC = os.getenv("KAFKA_TOPIC_RAW", "stock-raw-data")
+CHECKPOINT_LOCATION = os.getenv("BRONZE_CHECKPOINT", "/opt/spark/checkpoints/bronze")
+BRONZE_TABLE_PATH = os.getenv("BRONZE_TABLE_PATH", "/opt/spark/delta_tables/bronze")
+WATERMARK_DELAY = os.getenv("BRONZE_WATERMARK_DELAY", "1 day")  # Acceptable lateness
+MAX_OFFSETS_PER_TRIGGER = os.getenv("MAX_OFFSETS_PER_TRIGGER", None)  # optional
+STARTING_OFFSETS = os.getenv("KAFKA_STARTING_OFFSETS", "latest")  # "latest" in production normally
+APP_NAME = "bronze_ingestion"
+
+# === Spark session with Delta config ===
+spark = (
+    SparkSession.builder.appName(APP_NAME)
+    .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+    .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
+    # Critical: Set timezone to UTC for consistent timestamp handling
+    .config("spark.sql.session.timeZone", "UTC")
+    # tune if needed:
+    .config("spark.sql.shuffle.partitions", os.getenv("SPARK_SHUFFLE_PARTITIONS", "8"))
+    .getOrCreate()
 )
 
-# Configurable behaviour
-MICROBATCH_TRIGGER = "10 seconds"
-IDLE_PRINT_EVERY = 0  # 0 = never print for idle batches; set to e.g. 30 to log once every 30 idle iterations
+# Helpful for debugging/logging
+spark.sparkContext.setLogLevel(os.getenv("SPARK_LOG_LEVEL", "WARN"))
 
-# Try to import config from repo; otherwise use sensible defaults for local dev
-try:
-    from config import (
-        create_spark_session,
-        get_kafka_read_options,
-        KAFKA_TOPIC_RAW,
-        DELTA_PATH_BRONZE,
-        CHECKPOINT_PATH_BRONZE,
-        RAW_MESSAGE_SCHEMA,
+
+# === Helper: parse JSON string value to columns ===
+def parse_kafka_value(df: DataFrame) -> DataFrame:
+    """
+    Expects Kafka raw stream with value column as bytes/string (JSON).
+    Produces columns:
+      symbol, timestamp (long), open, high, low, close, volume,
+      source, source_interval, fetched_from, ingested_at (ISO string),
+      backfill_window_start, backfill_window_end
+    plus computed:
+      ts_utc (timestamp), date (string yyyy-MM-dd)
+    """
+    # value is bytes -> cast to string
+    df2 = df.selectExpr("CAST(value AS STRING) as json_str", "topic", "partition", "offset")
+    
+    # parse common fields; do robust JSON parsing to avoid job crash on malformed messages
+    df3 = df2.withColumn("_parsed", F.from_json("json_str", F.schema_of_json(F.lit(json.dumps({
+        "symbol":"", "timestamp":0, "open":0.0, "high":0.0, "low":0.0, "close":0.0, "volume":0,
+        "source":"", "source_interval":"", "fetched_from":"", "ingested_at":"", 
+        "backfill_window_start":"", "backfill_window_end":""
+    })))))
+    
+    # explode parsed into columns (null-safe)
+    parsed = df3.select(
+        F.col("_parsed.symbol").alias("symbol"),
+        F.col("_parsed.timestamp").alias("timestamp_secs"),
+        F.col("_parsed.open").alias("open"),
+        F.col("_parsed.high").alias("high"),
+        F.col("_parsed.low").alias("low"),
+        F.col("_parsed.close").alias("close"),
+        F.col("_parsed.volume").alias("volume"),
+        F.col("_parsed.source").alias("source"),
+        F.col("_parsed.source_interval").alias("source_interval"),
+        F.col("_parsed.fetched_from").alias("fetched_from"),
+        F.col("_parsed.ingested_at").alias("ingested_at_str"),
+        F.col("_parsed.backfill_window_start").alias("backfill_window_start_str"),
+        F.col("_parsed.backfill_window_end").alias("backfill_window_end_str"),
+        "topic", "partition", "offset"
     )
-except Exception:
-    def create_spark_session(app_name: str):
-        return SparkSession.builder \
-            .appName(app_name) \
-            .master("local[*]") \
-            .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
-            .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog") \
-            .getOrCreate()
+    
+    # Normalize and type-cast
+    parsed = parsed.withColumn("symbol", F.trim(F.upper(F.col("symbol"))))
+    parsed = parsed.withColumn("timestamp_secs", F.col("timestamp_secs").cast("long"))
+    
+    # **CRITICAL FIX**: Convert epoch secs -> timestamp using direct cast (ensures UTC)
+    # OLD (BROKEN): F.to_timestamp(F.from_unixtime(F.col("timestamp_secs")), "yyyy-MM-dd HH:mm:ss")
+    # NEW (FIXED): Direct cast to timestamp - Spark interprets epoch as UTC
+    parsed = parsed.withColumn("ts_utc", F.col("timestamp_secs").cast("long").cast("timestamp"))
+    
+    parsed = parsed.withColumn("open", F.col("open").cast("double"))
+    parsed = parsed.withColumn("high", F.col("high").cast("double"))
+    parsed = parsed.withColumn("low", F.col("low").cast("double"))
+    parsed = parsed.withColumn("close", F.col("close").cast("double"))
+    parsed = parsed.withColumn("volume", F.col("volume").cast("long"))
+    
+    # ingested_at: try parse string iso -> timestamp; fallback to current_timestamp if missing
+    parsed = parsed.withColumn(
+        "ingested_at",
+        F.coalesce(
+            F.to_timestamp("ingested_at_str"),
+            F.current_timestamp()
+        )
+    )
+    
+    parsed = parsed.withColumn(
+        "backfill_window_start",
+        F.to_timestamp("backfill_window_start_str")
+    ).withColumn(
+        "backfill_window_end",
+        F.to_timestamp("backfill_window_end_str")
+    )
+    
+    # Add date partition (UTC date of event)
+    parsed = parsed.withColumn("date", F.date_format(F.col("ts_utc"), "yyyy-MM-dd"))
+    
+    # Drop rows without symbol or timestamp or non-sensible prices
+    parsed = parsed.filter(F.col("symbol").isNotNull() & F.col("timestamp_secs").isNotNull())
+    
+    return parsed
 
-    def get_kafka_read_options(topic: str, starting_offsets: str = "latest") -> Dict:
-        return {
-            "kafka.bootstrap.servers": os.getenv("KAFKA_BOOTSTRAP", "redpanda:9092"),
-            "subscribe": topic,
-            "startingOffsets": starting_offsets,
-            "failOnDataLoss": "false"
-        }
 
-    KAFKA_TOPIC_RAW = os.getenv("KAFKA_TOPIC_RAW", "stock-raw-data")
-    DELTA_PATH_BRONZE = os.getenv("DELTA_PATH_BRONZE", "/opt/spark/delta_tables/bronze")
-    CHECKPOINT_PATH_BRONZE = os.getenv("CHECKPOINT_PATH_BRONZE", "/opt/spark/checkpoints/bronze")
-    RAW_MESSAGE_SCHEMA = StructType([
-        StructField("symbol", StringType(), True),
-        StructField("timestamp", LongType(), True),
-        StructField("open", DoubleType(), True),
-        StructField("high", DoubleType(), True),
-        StructField("low", DoubleType(), True),
-        StructField("close", DoubleType(), True),
-        StructField("volume", LongType(), True),
-        StructField("source", StringType(), True),
-        StructField("source_interval", StringType(), True),
-        StructField("fetched_from", StringType(), True),
-        StructField("ingested_at", StringType(), True),
-        StructField("backfill_window_start", StringType(), True),
-        StructField("backfill_window_end", StringType(), True),
-    ])
-
-DLQ_PATH = os.getenv("BRONZE_DLQ_PATH", "/opt/spark/delta_tables/bronze_dlq")
-
-def _ensure_paths():
-    Path(DELTA_PATH_BRONZE).parent.mkdir(parents=True, exist_ok=True)
-    Path(CHECKPOINT_PATH_BRONZE).parent.mkdir(parents=True, exist_ok=True)
-    Path(DLQ_PATH).parent.mkdir(parents=True, exist_ok=True)
-
-def _safe_rename_metadata(df):
-    rename_map = {
-        "kafka_key": "kafka_key_meta",
-        "kafka_timestamp": "kafka_timestamp_meta",
-        "kafka_partition": "kafka_partition_meta",
-        "kafka_offset": "kafka_offset_meta",
+# === Upsert (MERGE) helper ===
+def merge_to_bronze(batch_df: DataFrame, batch_id: int):
+    """
+    Called per micro-batch. Performs:
+      - inside-batch dedup by (symbol, ts_utc, source_interval) keeping row with latest ingested_at
+      - MERGE into delta table
+    """
+    if batch_df.rdd.isEmpty():
+        print(f"[bronze] Batch {batch_id} empty; skipping")
+        return
+    
+    # Normalize columns and dedupe within batch:
+    # Keep newest row per (symbol, ts_utc, source_interval) determined by ingested_at.
+    window = Window.partitionBy("symbol", "ts_utc", "source_interval").orderBy(F.col("ingested_at").desc())
+    deduped = (
+        batch_df
+        .withColumn("_rn", F.row_number().over(window))
+        .filter(F.col("_rn") == 1)
+        .drop("_rn")
+    )
+    
+    # Select final set of columns to persist
+    bronze_cols = [
+        "symbol",
+        "ts_utc",
+        "timestamp_secs",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "source",
+        "source_interval",
+        "fetched_from",
+        "ingested_at",
+        "backfill_window_start",
+        "backfill_window_end",
+        "date"
+    ]
+    deduped = deduped.select(*[c for c in bronze_cols if c in deduped.columns])
+    
+    # Ensure directory/table exists
+    if not DeltaTable.isDeltaTable(spark, BRONZE_TABLE_PATH):
+        # initial write: partition by date and symbol
+        deduped.write.format("delta").mode("overwrite").option("overwriteSchema", "true").partitionBy("date", "symbol").save(BRONZE_TABLE_PATH)
+        print(f"[bronze] Batch {batch_id}: created bronze table at {BRONZE_TABLE_PATH} with {deduped.count()} rows")
+        return
+    
+    # MERGE: match on (symbol, ts_utc, source_interval)
+    bronze_dt = DeltaTable.forPath(spark, BRONZE_TABLE_PATH)
+    
+    # Build merge condition
+    merge_condition = "target.symbol = source.symbol AND target.ts_utc = source.ts_utc AND target.source_interval = source.source_interval"
+    
+    # When matched, update all fields (we prefer incoming row since it is the latest ingested_at within micro-batch)
+    update_map = {
+        "timestamp_secs": "source.timestamp_secs",
+        "open": "source.open",
+        "high": "source.high",
+        "low": "source.low",
+        "close": "source.close",
+        "volume": "source.volume",
+        "source": "source.source",
+        "fetched_from": "source.fetched_from",
+        "ingested_at": "source.ingested_at",
+        "backfill_window_start": "source.backfill_window_start",
+        "backfill_window_end": "source.backfill_window_end",
+        "date": "source.date"
     }
-    cols = set(df.columns)
-    for old, new in rename_map.items():
-        if old in cols and new not in cols:
-            df = df.withColumnRenamed(old, new)
-        elif old in cols and new in cols:
-            df = df.drop(old)
-    return df
+    
+    # Do the merge using DataFrame as source (create temp view)
+    source_temp = f"tmp_batch_{batch_id}"
+    deduped.createOrReplaceTempView(source_temp)
+    src_df = spark.table(source_temp)
+    
+    # Perform delta merge
+    bronze_dt.alias("target").merge(
+        src_df.alias("source"),
+        merge_condition
+    ).whenMatchedUpdate(
+        set={k: F.expr(v) for k, v in update_map.items()}
+    ).whenNotMatchedInsert(
+        values={k: F.expr(f"source.{k}") for k in update_map.keys()} | {
+            # we also need to insert symbol, ts_utc and source_interval (keys)
+            "symbol": F.expr("source.symbol"),
+            "ts_utc": F.expr("source.ts_utc"),
+            "source_interval": F.expr("source.source_interval")
+        }
+    ).execute()
+    
+    print(f"[bronze] Batch {batch_id}: merged {deduped.count()} rows into bronze table")
 
-def _get_offset_summary(batch_df):
-    start_offsets = {}
-    end_offsets = {}
-    try:
-        if "kafka_partition" in batch_df.columns and "kafka_offset" in batch_df.columns:
-            part_col = "kafka_partition"
-            off_col = "kafka_offset"
-        elif "kafka_partition_meta" in batch_df.columns and "kafka_offset_meta" in batch_df.columns:
-            part_col = "kafka_partition_meta"
-            off_col = "kafka_offset_meta"
-        else:
-            return {}, {}
 
-        agg = batch_df.groupBy(part_col).agg(
-            F.min(off_col).alias("start_off"),
-            F.max(off_col).alias("end_off"),
-        ).collect()
-
-        for row in agg:
-            p = str(row[part_col])
-            start_offsets[p] = int(row["start_off"])
-            end_offsets[p] = int(row["end_off"])
-    except Exception:
-        return {}, {}
-
-    return start_offsets, end_offsets
-
-def _format_offset_map(offset_map):
-    if not offset_map:
-        return "{}"
-    return "{" + ", ".join([f"'{k}': {v}" for k, v in offset_map.items()]) + "}"
-
-def foreach_batch_writer(batch_df, batch_id):
-    start = time.time()
-    try:
-        if batch_df is None:
-            return
-
-        df = _safe_rename_metadata(batch_df)
-        try:
-            input_rows = df.count()
-        except Exception:
-            input_rows = 0
-
-        start_offsets, end_offsets = _get_offset_summary(df)
-
-        if "symbol" in df.columns:
-            good = df.filter(F.col("symbol").isNotNull())
-            bad = df.filter(F.col("symbol").isNull())
-        else:
-            good = df.limit(0)
-            bad = df
-
-        bad_written = 0
-        try:
-            bad_count = bad.count()
-            if bad_count > 0:
-                bad_with_meta = bad.select(F.current_timestamp().alias("failed_at"), F.lit(batch_id).alias("batch_id"), *bad.columns)
-                bad_with_meta.write.format("delta").mode("append").option("mergeSchema", "true").save(DLQ_PATH)
-                bad_written = bad_count
-        except Exception:
-            bad_written = 0
-
-        bronze_written = 0
-        try:
-            good_count = good.count()
-            if good_count > 0:
-                good_safe = _safe_rename_metadata(good)
-                good_safe.write.format("delta").mode("append").option("mergeSchema", "true").save(DELTA_PATH_BRONZE)
-                bronze_written = good_count
-        except Exception as e:
-            print(f"[error] Bronze write failed batch {batch_id}: {e}")
-            traceback.print_exc()
-            try:
-                df_with_meta = df.select(F.current_timestamp().alias("failed_at"), F.lit(batch_id).alias("batch_id"), *df.columns)
-                df_with_meta.write.format("delta").mode("append").option("mergeSchema", "true").save(DLQ_PATH)
-            except Exception:
-                pass
-            bronze_written = 0
-
-        dur_ms = int((time.time() - start) * 1000)
-
-        # Print only when actual input rows exist — keeps logs minimal
-        if input_rows > 0 or IDLE_PRINT_EVERY > 0:
-            # If idle printing is enabled, we still want to print only every IDLE_PRINT_EVERY idle iterations.
-            # For simplicity we let the main loop decide idle printing. Here print when input_rows>0.
-            print("--------------------------------------------------------------------------------")
-            print(f"Batch: {batch_id}")
-            print(f"Input rows: {input_rows}")
-            print(f"Processing time (triggerExecution): {dur_ms} ms")
-            start_fmt = _format_offset_map(start_offsets)
-            end_fmt = _format_offset_map(end_offsets)
-            print(f"  Kafka offset: start={{{KAFKA_TOPIC_RAW}: {start_fmt}}}, end={{{KAFKA_TOPIC_RAW}: {end_fmt}}}")
-            print(f"Output rows: -1")
-            print(f"Bronze written: {bronze_written} rows; DLQ written: {bad_written} rows")
-            print("--------------------------------------------------------------------------------")
-
-    except Exception as e:
-        print(f"[foreach_batch][exception] batch {batch_id}: {e}")
-        traceback.print_exc()
-
-def perform_initial_load_if_needed(spark):
-    try:
-        bronze_exists = os.path.exists(DELTA_PATH_BRONZE) and os.path.isdir(DELTA_PATH_BRONZE)
-        if bronze_exists:
-            try:
-                existing = spark.read.format("delta").load(DELTA_PATH_BRONZE)
-                cnt = existing.count()
-                if cnt > 0:
-                    print(f"✓ Bronze table exists with {cnt} rows")
-                    return
-            except Exception:
-                pass
-
-        print("⚠ Bronze missing/empty - doing initial batch read from Kafka (earliest)")
-        opts = get_kafka_read_options(KAFKA_TOPIC_RAW, starting_offsets="earliest")
-        kafka_batch = spark.read.format("kafka").options(**opts).load()
-        parsed = kafka_batch.select(
-            F.col("key").cast(StringType()).alias("kafka_key"),
-            F.from_json(F.col("value").cast(StringType()), RAW_MESSAGE_SCHEMA).alias("data"),
-            F.col("timestamp").alias("kafka_timestamp"),
-            F.col("partition").alias("kafka_partition"),
-            F.col("offset").alias("kafka_offset")
-        ).select("data.*", F.current_timestamp().alias("bronze_timestamp"), "kafka_key", "kafka_timestamp", "kafka_partition", "kafka_offset")
-
-        parsed_safe = _safe_rename_metadata(parsed)
-        non_null = parsed_safe.filter(F.col("symbol").isNotNull())
-        c = non_null.count()
-        if c > 0:
-            non_null.write.format("delta").mode("append").option("mergeSchema", "true").save(DELTA_PATH_BRONZE)
-            print(f"[initial] wrote {c} rows to Bronze")
-        else:
-            print("[initial] no parsed rows found during earliest read")
-    except Exception as e:
-        print(f"[initial][error] {e}")
-        traceback.print_exc()
-
+# === Main streaming read ===
 def main():
-    _ensure_paths()
-    spark = create_spark_session("BronzeIngestMinimal")
-    # Quiet Spark internal logs
-    try:
-        spark.sparkContext.setLogLevel("WARN")
-    except Exception:
-        pass
-
-    print("BRONZE LAYER INGESTION - Starting (minimal logs)")
-    print(f"Reading from Kafka topic: {KAFKA_TOPIC_RAW}")
-    print(f"Writing to Delta table: {DELTA_PATH_BRONZE}")
-    print(f"Checkpoint location: {CHECKPOINT_PATH_BRONZE}")
-
-    perform_initial_load_if_needed(spark)
-
-    kafka_opts = get_kafka_read_options(KAFKA_TOPIC_RAW, starting_offsets="latest")
-    kafka_df = spark.readStream.format("kafka").options(**kafka_opts).load()
-
-    parsed_stream = kafka_df.select(
-        F.col("key").cast(StringType()).alias("kafka_key"),
-        F.col("value").cast(StringType()).alias("raw_value"),
-        F.from_json(F.col("value").cast(StringType()), RAW_MESSAGE_SCHEMA).alias("data"),
-        F.col("timestamp").alias("kafka_timestamp"),
-        F.col("partition").alias("kafka_partition"),
-        F.col("offset").alias("kafka_offset"),
-    ).select("data.*", F.current_timestamp().alias("bronze_timestamp"), "kafka_key", "kafka_timestamp", "kafka_partition", "kafka_offset")
-
+    read_options = {
+        "kafka.bootstrap.servers": KAFKA_BOOTSTRAP,
+        "subscribe": KAFKA_TOPIC,
+        "startingOffsets": STARTING_OFFSETS,
+        "failOnDataLoss": "false",
+    }
+    
+    if MAX_OFFSETS_PER_TRIGGER:
+        read_options["maxOffsetsPerTrigger"] = int(MAX_OFFSETS_PER_TRIGGER)
+    
+    raw_stream = (
+        spark.readStream.format("kafka")
+        .options(**read_options)
+        .load()
+    )
+    
+    parsed = parse_kafka_value(raw_stream)
+    
+    # Apply watermark on event time (ts_utc)
+    # Note: watermark applies to aggregation state and will also help Spark drop very late events based on watermark.
+    # We still do dedupe per micro-batch and MERGE, so slight lateness is tolerated as long as event hasn't been garbage-collected.
+    stream_with_watermark = parsed.withWatermark("ts_utc", WATERMARK_DELAY)
+    
+    # Because we use foreachBatch + MERGE, we can pass micro-batches directly
     query = (
-        parsed_stream.writeStream
-        .foreachBatch(lambda df, bid: foreach_batch_writer(df, bid))
-        .option("checkpointLocation", CHECKPOINT_PATH_BRONZE)
-        .trigger(processingTime=MICROBATCH_TRIGGER)
+        stream_with_watermark.writeStream
+        .foreachBatch(merge_to_bronze)
+        .option("checkpointLocation", CHECKPOINT_LOCATION)
+        .trigger(processingTime=os.getenv("BRONZE_TRIGGER", "30 seconds"))
         .start()
     )
+    
+    query.awaitTermination()
 
-    print(f"Streaming query started (id={query.id}) - micro-batch every {MICROBATCH_TRIGGER}")
-
-    idle_counter = 0
-    try:
-        while query.isActive:
-            prog = query.lastProgress
-            if prog:
-                num_in = prog.get("numInputRows", 0)
-                # print only when there are input rows or if idle printing configured
-                if num_in > 0:
-                    # we rely on foreachBatch to print the full per-batch summary and bronze written line
-                    idle_counter = 0
-                else:
-                    idle_counter += 1
-                    if IDLE_PRINT_EVERY > 0 and idle_counter >= IDLE_PRINT_EVERY:
-                        # print a tiny heartbeat so you know it's alive but quiet
-                        b = prog.get("batchId", "N/A")
-                        dur = prog.get("durationMs", {}).get("triggerExecution", 0)
-                        start_off = prog.get("sources", [{}])[0].get("startOffset", "N/A")
-                        end_off = prog.get("sources", [{}])[0].get("endOffset", "N/A")
-                        print("--------------------------------------------------------------------------------")
-                        print(f"Batch: {b} (idle)")
-                        print(f"Input rows: {num_in}")
-                        print(f"Processing time (triggerExecution): {dur} ms")
-                        print(f"  Kafka offset: start={start_off}, end={end_off}")
-                        print("Output rows: -1")
-                        print("--------------------------------------------------------------------------------")
-                        idle_counter = 0
-            query.awaitTermination(30)
-    except KeyboardInterrupt:
-        print("Stopping Bronze ingestion (user requested)")
-    finally:
-        if query and query.isActive:
-            query.stop()
-        spark.stop()
 
 if __name__ == "__main__":
     main()

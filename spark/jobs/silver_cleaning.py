@@ -47,17 +47,24 @@ def clean_and_validate(df):
 
     cols = set(df.columns)
 
-    # 1) If there is an epoch-seconds 'timestamp' column -> convert it
-    if "timestamp" in cols:
-        df2 = df.withColumn("ts", F.from_unixtime(F.col("timestamp")).cast("timestamp"))
+    # 1) If there's a 'ts_utc' column from new bronze layer -> use it directly
+    if "ts_utc" in cols:
+        # Bronze layer already created proper UTC timestamp
+        df2 = df.withColumn("ts", F.col("ts_utc"))
+    
+    # 2) Else if there is an epoch-seconds 'timestamp' column -> convert it
+    elif "timestamp" in cols:
+        # Convert epoch seconds directly to timestamp
+        # Using expression to ensure UTC interpretation regardless of server timezone
+        df2 = df.withColumn("ts", (F.col("timestamp").cast("long").cast("timestamp")))
 
-    # 2) Else if there's a 'ts' column already -> try to normalize it
+    # 3) Else if there's a 'ts' column already -> try to normalize it
     elif "ts" in cols:
         # is it numeric epoch or already timestamp?
         ts_field = next((f for f in df.schema.fields if f.name == "ts"), None)
         if ts_field is not None and isinstance(ts_field.dataType, (LongType, IntegerType)):
-            # numeric epoch seconds -> convert
-            df2 = df.withColumn("ts", F.from_unixtime(F.col("ts")).cast("timestamp"))
+            # numeric epoch seconds -> convert using direct cast to ensure UTC
+            df2 = df.withColumn("ts", (F.col("ts").cast("long").cast("timestamp")))
         else:
             # assume it's already a TimestampType or string; cast to timestamp to be safe
             if ts_field is not None and isinstance(ts_field.dataType, StringType):
@@ -65,13 +72,13 @@ def clean_and_validate(df):
             else:
                 df2 = df.withColumn("ts", F.col("ts"))
 
-    # 3) Else try bronze_timestamp (many pipelines include an ingestion timestamp there)
+    # 4) Else try bronze_timestamp (many pipelines include an ingestion timestamp there)
     elif "bronze_timestamp" in cols:
         # bronze_timestamp might be ISO string or epoch; try a best-effort conversion:
         # - if numeric: treat as epoch seconds
         bt_field = next((f for f in df.schema.fields if f.name == "bronze_timestamp"), None)
         if bt_field is not None and isinstance(bt_field.dataType, (LongType, IntegerType)):
-            df2 = df.withColumn("ts", F.from_unixtime(F.col("bronze_timestamp")).cast("timestamp"))
+            df2 = df.withColumn("ts", (F.col("bronze_timestamp").cast("long").cast("timestamp")))
         else:
             # try parsing ISO string to timestamp
             df2 = df.withColumn("ts", F.to_timestamp(F.col("bronze_timestamp")))
@@ -80,7 +87,7 @@ def clean_and_validate(df):
         # helpful error: list available columns so you can see what the microBatch has
         raise ValueError(
             "No timestamp column found in micro-batch. Expected one of: "
-            "'timestamp' (epoch sec), 'ts', or 'bronze_timestamp'. "
+            "'ts_utc', 'timestamp' (epoch sec), 'ts', or 'bronze_timestamp'. "
             f"Available columns: {sorted(list(cols))}"
         )
 
