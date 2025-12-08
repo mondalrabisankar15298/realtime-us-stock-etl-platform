@@ -72,22 +72,22 @@ def clean_and_validate(df):
             else:
                 df2 = df.withColumn("ts", F.col("ts"))
 
-    # 4) Else try bronze_timestamp (many pipelines include an ingestion timestamp there)
-    elif "bronze_timestamp" in cols:
-        # bronze_timestamp might be ISO string or epoch; try a best-effort conversion:
+    # 4) Else try ingested_at (many pipelines include an ingestion timestamp there)
+    elif "ingested_at" in cols:
+        # ingested_at might be ISO string or epoch; try a best-effort conversion:
         # - if numeric: treat as epoch seconds
-        bt_field = next((f for f in df.schema.fields if f.name == "bronze_timestamp"), None)
+        bt_field = next((f for f in df.schema.fields if f.name == "ingested_at"), None)
         if bt_field is not None and isinstance(bt_field.dataType, (LongType, IntegerType)):
-            df2 = df.withColumn("ts", (F.col("bronze_timestamp").cast("long").cast("timestamp")))
+            df2 = df.withColumn("ts", (F.col("ingested_at").cast("long").cast("timestamp")))
         else:
             # try parsing ISO string to timestamp
-            df2 = df.withColumn("ts", F.to_timestamp(F.col("bronze_timestamp")))
+            df2 = df.withColumn("ts", F.to_timestamp(F.col("ingested_at")))
 
     else:
         # helpful error: list available columns so you can see what the microBatch has
         raise ValueError(
             "No timestamp column found in micro-batch. Expected one of: "
-            "'ts_utc', 'timestamp' (epoch sec), 'ts', or 'bronze_timestamp'. "
+            "'ts_utc', 'timestamp' (epoch sec), 'ts', or 'ingested_at'. "
             f"Available columns: {sorted(list(cols))}"
         )
 
@@ -107,7 +107,7 @@ def clean_and_validate(df):
     df2 = df2.withColumn("ingestion_date", F.date_format(F.col("ts"), "yyyy-MM-dd"))
     df2 = df2.withColumn("processed_at", F.current_timestamp())
 
-    # Keep bronze_timestamp (for dedup) in the micro-batch
+    # Keep ingested_at (for dedup) in the micro-batch
     out = df2.select(
         "symbol",
         "ts",
@@ -119,7 +119,7 @@ def clean_and_validate(df):
         "is_valid",
         "ingestion_date",
         "processed_at",
-        "bronze_timestamp"
+        "ingested_at"
     )
     return out
 
@@ -182,8 +182,8 @@ def upsert_to_silver(microBatchDF, batchId):
         # transform
         df = clean_and_validate(microBatchDF)
 
-        # deduplicate by (symbol, ts), keep latest bronze_timestamp
-        win = Window.partitionBy("symbol", "ts").orderBy(F.col("bronze_timestamp").desc())
+        # deduplicate by (symbol, ts), keep latest ingested_at
+        win = Window.partitionBy("symbol", "ts").orderBy(F.col("ingested_at").desc())
         deduped = (
             df.withColumn("row_num", F.row_number().over(win))
               .filter(F.col("row_num") == 1)
@@ -233,6 +233,25 @@ def upsert_to_silver(microBatchDF, batchId):
         print(f"[foreach_batch][exception] batch {batchId}: {e}")
         traceback.print_exc()
 
+def wait_for_bronze_table(spark, timeout_seconds=600):
+    """
+    Blocks until the Bronze Delta table exists or timeout is reached.
+    """
+    import time
+    start_time = time.time()
+    print(f"Waiting for Bronze table at {DELTA_PATH_BRONZE}...")
+    
+    while True:
+        if _delta_table_exists(spark, DELTA_PATH_BRONZE):
+            print("✓ Bronze table found!")
+            return True
+            
+        if time.time() - start_time > timeout_seconds:
+            raise TimeoutError(f"Bronze table not found after {timeout_seconds} seconds")
+            
+        time.sleep(10)
+        print("... still waiting for Bronze table ...")
+
 def perform_initial_load_if_needed(spark):
     """
     If Silver missing, try to read Bronze and do an initial upsert.
@@ -243,6 +262,9 @@ def perform_initial_load_if_needed(spark):
         if silver_exists:
             # nothing to do
             return
+
+        # Ensure Bronze exists before trying to read
+        wait_for_bronze_table(spark)
 
         # if Silver missing, try to read Bronze for any existing data
         bronze_exists = os.path.exists(DELTA_PATH_BRONZE) and os.path.isdir(DELTA_PATH_BRONZE)
@@ -284,6 +306,15 @@ def main():
     print(f"Reading from Bronze: {DELTA_PATH_BRONZE}")
     print(f"Writing to Silver: {DELTA_PATH_SILVER}")
     print(f"Checkpoint: {CHECKPOINT_PATH_SILVER}")
+
+    print(f"Checkpoint: {CHECKPOINT_PATH_SILVER}")
+
+    # Wait for Bronze table to be ready (handles race condition on fresh start)
+    try:
+        wait_for_bronze_table(spark)
+    except Exception as e:
+        print(f"FATAL: {e}")
+        sys.exit(1)
 
     perform_initial_load_if_needed(spark)
 

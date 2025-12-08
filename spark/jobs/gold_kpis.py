@@ -277,7 +277,7 @@ def process_gold_stream(batch_mode=False):
     
     try:
         # Wait for Silver table to exist (with retry logic)
-        max_retries = 30
+        max_retries = 3
         retry_delay = 10  # seconds
         
         for attempt in range(max_retries):
@@ -308,7 +308,7 @@ def process_gold_stream(batch_mode=False):
                     time.sleep(retry_delay)
                 else:
                     print("✗ Silver table not available after maximum retries")
-                    print("Gold job will exit. Restart once Silver has data.")
+                    print("Gold job will exit gracefully (no data to process).")
                     return
                     
             except Exception as e:

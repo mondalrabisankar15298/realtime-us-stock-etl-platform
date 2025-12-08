@@ -6,9 +6,12 @@ Run this as a Spark job or Airflow DAG
 """
 
 import sys
+import os
 from pyspark.sql import SparkSession
 from delta import configure_spark_with_delta_pip
 import psycopg2
+from datetime import datetime, timedelta
+import os # Added for env var check if needed, though mostly replaced by dynamic logic
 
 # Configuration
 DELTA_PATH_GOLD = "/opt/spark/delta_tables/gold"
@@ -32,7 +35,42 @@ def create_spark_session():
     spark = configure_spark_with_delta_pip(builder).getOrCreate()
     spark.sparkContext.setLogLevel("WARN")
     return spark
+    return spark
 
+
+def get_max_timestamp(table_name):
+    """
+    Get the maximum timestamp from a TimescaleDB table.
+    Returns None if table is empty or doesn't exist.
+    """
+    try:
+        conn = psycopg2.connect(
+            host=TIMESCALE_HOST,
+            port=TIMESCALE_PORT,
+            database=TIMESCALE_DB,
+            user=TIMESCALE_USER,
+            password=TIMESCALE_PASSWORD
+        )
+        cursor = conn.cursor()
+        
+        # Check if table exists first
+        cursor.execute(f"SELECT to_regclass('public.{table_name}');")
+        if cursor.fetchone()[0] is None:
+            return None
+            
+        cursor.execute(f"SELECT MAX(ts) FROM {table_name};")
+        result = cursor.fetchone()
+        
+        cursor.close()
+        conn.close()
+        
+        if result and result[0]:
+            return result[0]
+        return None
+        
+    except Exception as e:
+        print(f"Warning: Could not get max timestamp from {table_name}: {e}")
+        return None
 
 def sync_gold_to_timescale(spark, batch_mode=False):
     """
@@ -52,12 +90,46 @@ def sync_gold_to_timescale(spark, batch_mode=False):
     print(f"Reading from: {DELTA_PATH_GOLD}")
     df_gold = spark.read.format("delta").load(DELTA_PATH_GOLD)
     
-    if not batch_mode:
-        # Only sync data from last 24 hours for incremental updates
+    if batch_mode:
+        print("Batch mode enabled: Syncing ALL data.")
+    else:
+        # Dynamic State-Aware Sync
+        # 1. Check max timestamp in destination
+        last_ts = get_max_timestamp("gold_stocks")
+        
         from pyspark.sql import functions as F
-        df_gold = df_gold.filter(
-            F.col("ts") >= F.expr("current_timestamp() - interval 24 hours")
-        )
+        
+        if last_ts is None:
+            print("Destination table empty or not found. Performing FULL table sync.")
+            # No filter applied = Full Load
+        else:
+            # 2. Calculate start time: min(now - 24h, last_ts)
+            # This ensures we cover at least 24h (for updates) AND any gap if last_ts is old
+            print(f"Found existing data up to: {last_ts}")
+            
+            # We can't easily mix python datetime and spark current_timestamp in min()
+            # So we'll frame it as: Filter data where ts >= (last_ts) OR ts >= (now - 24h)
+            # Which is equivalent to: ts >= min(last_ts, now - 24h)
+            # Wait, valid logic is: We want to re-sync everything AFTER the gap.
+            # So looking locally: default start is last_ts.
+            # But we want a safety buffer of 24h.
+            # Logic: If last_ts is 7 days ago. We want >= 7 days ago.
+            # If last_ts is 1 minute ago. We want >= 24 hours ago (to catch recent late arrivals).
+            # So effective start_ts = MIN(last_ts, now - 24h).
+            
+            # Since 'last_ts' is a python object, we can just pass it as a literal.
+            
+            # Construct expression: (ts >= last_ts) OR (ts >= current_timestamp() - interval 24 hours)
+            # Actually, to get MORE data (older time), we need the SMALLER timestamp.
+            # Filter: ts >= LEAST( lit(last_ts), current_timestamp() - interval 10 minutes )
+            
+            df_gold = df_gold.filter(
+                F.col("ts") >= F.least(
+                    F.lit(last_ts), 
+                    F.expr("current_timestamp() - interval 10 minutes")
+                )
+            )
+            print("Applied dynamic filter: ts >= min(last_max_ts, now - 10m)")
     
     # Select only columns that exist in TimescaleDB gold_stocks table
     # TimescaleDB schema: symbol, ts, close, volume, sma_5, sma_20, sma_50, ema_9, ema_21,
@@ -202,11 +274,24 @@ def sync_silver_to_timescale(spark, batch_mode=False):
         print(f"Reading from: {DELTA_PATH_SILVER}")
         df_silver = spark.read.format("delta").load(DELTA_PATH_SILVER)
         
-        if not batch_mode:
+        if batch_mode:
+            print("Batch mode enabled: Syncing ALL data.")
+        else:
+            # Dynamic State-Aware Sync
+            last_ts = get_max_timestamp("silver_stocks")
             from pyspark.sql import functions as F
-            df_silver = df_silver.filter(
-                F.col("ts") >= F.expr("current_timestamp() - interval 24 hours")
-            )
+            
+            if last_ts is None:
+                print("Destination table empty. Performing FULL table sync.")
+            else:
+                print(f"Found existing data up to: {last_ts}")
+                df_silver = df_silver.filter(
+                    F.col("ts") >= F.least(
+                        F.lit(last_ts), 
+                        F.expr("current_timestamp() - interval 10 minutes")
+                    )
+                )
+                print("Applied dynamic filter: ts >= min(last_max_ts, now - 10m)")
         
         # Select only columns that exist in TimescaleDB silver_stocks table
         # TimescaleDB schema: symbol, ts, open, high, low, close, volume, is_valid, ingestion_date, processed_at
@@ -294,12 +379,13 @@ def main():
     """Main execution"""
     
     # Parse command line arguments
+    # batch_mode forces full load, ignoring dynamic logic
     batch_mode = "--batch" in sys.argv
     
     if batch_mode:
-        print("Running in BATCH mode (syncing all historical data)")
+        print("Running in FORCED BATCH mode (ignoring DB state)")
     else:
-        print("Running in INCREMENTAL mode (syncing last 24 hours)")
+        print("Running in SMART SYNC mode (dynamic time window)")
     
     # Create Spark session
     spark = create_spark_session()

@@ -28,7 +28,14 @@ CHECKPOINT_LOCATION = os.getenv("BRONZE_CHECKPOINT", "/opt/spark/checkpoints/bro
 BRONZE_TABLE_PATH = os.getenv("BRONZE_TABLE_PATH", "/opt/spark/delta_tables/bronze")
 WATERMARK_DELAY = os.getenv("BRONZE_WATERMARK_DELAY", "1 day")  # Acceptable lateness
 MAX_OFFSETS_PER_TRIGGER = os.getenv("MAX_OFFSETS_PER_TRIGGER", None)  # optional
-STARTING_OFFSETS = os.getenv("KAFKA_STARTING_OFFSETS", "latest")  # "latest" in production normally
+# Logic: 
+# 1. If explicit KAFKA_STARTING_OFFSETS set, use it.
+# 2. Else if FORCE_BACKFILL=true, default to "earliest" (to fetch backfilled data).
+# 3. Else default to "latest" (standard behavior).
+FORCE_BACKFILL = os.getenv("FORCE_BACKFILL", "false").lower() in ("true", "1", "yes")
+DEFAULT_STARTING_OFFSETS = "earliest" if FORCE_BACKFILL else "latest"
+STARTING_OFFSETS = os.getenv("KAFKA_STARTING_OFFSETS", DEFAULT_STARTING_OFFSETS)
+print(f"[config] FORCE_BACKFILL={FORCE_BACKFILL}, STARTING_OFFSETS={STARTING_OFFSETS}")
 APP_NAME = "bronze_ingestion"
 
 # === Spark session with Delta config ===
@@ -198,22 +205,21 @@ def merge_to_bronze(batch_df: DataFrame, batch_id: int):
     }
     
     # Do the merge using DataFrame as source (create temp view)
-    source_temp = f"tmp_batch_{batch_id}"
-    deduped.createOrReplaceTempView(source_temp)
-    src_df = spark.table(source_temp)
-    
-    # Perform delta merge
+    # Perform delta merge using DataFrame directly
     bronze_dt.alias("target").merge(
-        src_df.alias("source"),
+        deduped.alias("source"),
         merge_condition
     ).whenMatchedUpdate(
         set={k: F.expr(v) for k, v in update_map.items()}
     ).whenNotMatchedInsert(
-        values={k: F.expr(f"source.{k}") for k in update_map.keys()} | {
-            # we also need to insert symbol, ts_utc and source_interval (keys)
-            "symbol": F.expr("source.symbol"),
-            "ts_utc": F.expr("source.ts_utc"),
-            "source_interval": F.expr("source.source_interval")
+        values={
+            **{k: F.expr(f"source.{k}") for k in update_map.keys()},
+            **{
+                # we also need to insert symbol, ts_utc and source_interval (keys)
+                "symbol": F.expr("source.symbol"),
+                "ts_utc": F.expr("source.ts_utc"),
+                "source_interval": F.expr("source.source_interval")
+            }
         }
     ).execute()
     
