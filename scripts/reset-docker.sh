@@ -37,6 +37,7 @@ for container_id in $(docker ps -a --filter "name=airflow-" --format "{{.ID}}" 2
 for container_id in $(docker ps -a --filter "name=postgres-timescale" --format "{{.ID}}" 2>/dev/null); do docker rm -f "$container_id" 2>/dev/null || true; done
 for container_id in $(docker ps -a --filter "name=postgres-airflow" --format "{{.ID}}" 2>/dev/null); do docker rm -f "$container_id" 2>/dev/null || true; done
 for container_id in $(docker ps -a --filter "name=redpanda" --format "{{.ID}}" 2>/dev/null); do docker rm -f "$container_id" 2>/dev/null || true; done
+for container_id in $(docker ps -a --filter "name=redpanda-console" --format "{{.ID}}" 2>/dev/null); do docker rm -f "$container_id" 2>/dev/null || true; done
 for container_id in $(docker ps -a --filter "name=grafana" --format "{{.ID}}" 2>/dev/null); do docker rm -f "$container_id" 2>/dev/null || true; done
 
 echo "Step 3: Removing all volumes..."
@@ -60,10 +61,21 @@ for network_id in $(docker network ls --filter "name=stock-etl-network" --format
 echo "Step 5: Removing project-specific images (optional)..."
 read -p "Remove project images? (yes/no): " remove_images
 if [ "$remove_images" == "yes" ]; then
-    # Only remove images specific to this project
-    docker rmi stock-etl-spark:latest 2>/dev/null || echo "   stock-etl-spark image not found or in use"
-    docker rmi realtime-us-stock-etl-platform-producer:latest 2>/dev/null || echo "   producer image not found or in use"
-    echo "   Removed project-specific images"
+    # Only remove images specific to this project (built from Dockerfiles)
+    echo "   Removing project-specific images..."
+    docker rmi stock-etl-spark:latest 2>/dev/null || echo "   ⚠️  stock-etl-spark:latest not found or in use"
+    docker rmi custom-airflow:latest 2>/dev/null || echo "   ⚠️  custom-airflow:latest not found or in use"
+    docker rmi realtime-us-stock-etl-platform-producer:latest 2>/dev/null || echo "   ⚠️  realtime-us-stock-etl-platform-producer:latest not found or in use"
+    
+    # Optional: Remove base images used only by this project (commented out to be safe)
+    # Uncomment if you want to remove base images as well (may affect other projects)
+    # docker rmi docker.redpanda.com/redpandadata/redpanda:v23.3.3 2>/dev/null || echo "   redpanda image not found or in use"
+    # docker rmi docker.redpanda.com/redpandadata/console:v2.4.3 2>/dev/null || echo "   redpanda-console image not found or in use"
+    # docker rmi postgres:15-alpine 2>/dev/null || echo "   postgres image not found or in use"
+    # docker rmi timescale/timescaledb:latest-pg15 2>/dev/null || echo "   timescaledb image not found or in use"
+    # docker rmi grafana/grafana:10.2.3 2>/dev/null || echo "   grafana image not found or in use"
+    
+    echo "   ✓ Project-specific images removal completed"
 else
     echo "   Skipped image removal"
 fi

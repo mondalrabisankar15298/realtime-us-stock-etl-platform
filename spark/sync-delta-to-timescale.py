@@ -74,15 +74,11 @@ def get_max_timestamp(table_name):
 
 def sync_gold_to_timescale(spark, batch_mode=False):
     """
-    Sync Gold Delta table to TimescaleDB
-    
-    Args:
-        spark: SparkSession
-        batch_mode: If True, sync all data. If False, sync only recent data.
+    Sync Gold Delta table to TimescaleDB using Staging Table + UPSERT
     """
     
     print("=" * 80)
-    print("SYNCING DELTA LAKE → TIMESCALEDB")
+    print("SYNCING DELTA LAKE → TIMESCALEDB (Staging Upsert Mode)")
     print("=" * 80)
     
     # Read from Gold Delta table
@@ -94,35 +90,14 @@ def sync_gold_to_timescale(spark, batch_mode=False):
         print("Batch mode enabled: Syncing ALL data.")
     else:
         # Dynamic State-Aware Sync
-        # 1. Check max timestamp in destination
         last_ts = get_max_timestamp("gold_stocks")
-        
         from pyspark.sql import functions as F
         
         if last_ts is None:
             print("Destination table empty or not found. Performing FULL table sync.")
-            # No filter applied = Full Load
         else:
-            # 2. Calculate start time: min(now - 24h, last_ts)
-            # This ensures we cover at least 24h (for updates) AND any gap if last_ts is old
             print(f"Found existing data up to: {last_ts}")
-            
-            # We can't easily mix python datetime and spark current_timestamp in min()
-            # So we'll frame it as: Filter data where ts >= (last_ts) OR ts >= (now - 24h)
-            # Which is equivalent to: ts >= min(last_ts, now - 24h)
-            # Wait, valid logic is: We want to re-sync everything AFTER the gap.
-            # So looking locally: default start is last_ts.
-            # But we want a safety buffer of 24h.
-            # Logic: If last_ts is 7 days ago. We want >= 7 days ago.
-            # If last_ts is 1 minute ago. We want >= 24 hours ago (to catch recent late arrivals).
-            # So effective start_ts = MIN(last_ts, now - 24h).
-            
-            # Since 'last_ts' is a python object, we can just pass it as a literal.
-            
-            # Construct expression: (ts >= last_ts) OR (ts >= current_timestamp() - interval 24 hours)
-            # Actually, to get MORE data (older time), we need the SMALLER timestamp.
-            # Filter: ts >= LEAST( lit(last_ts), current_timestamp() - interval 10 minutes )
-            
+            # Filter for new or updated data (with 10-minute overlap)
             df_gold = df_gold.filter(
                 F.col("ts") >= F.least(
                     F.lit(last_ts), 
@@ -131,11 +106,7 @@ def sync_gold_to_timescale(spark, batch_mode=False):
             )
             print("Applied dynamic filter: ts >= min(last_max_ts, now - 10m)")
     
-    # Select only columns that exist in TimescaleDB gold_stocks table
-    # TimescaleDB schema: symbol, ts, close, volume, sma_5, sma_20, sma_50, ema_9, ema_21,
-    # rsi_14, vwap, macd, macd_signal, macd_histogram, atr_14, daily_return, volatility_5m,
-    # market_phase, price_change_pct, computed_at
-    # Note: open, high, low are NOT in TimescaleDB gold_stocks table
+    # Define columns
     timescale_columns = [
         "symbol", "ts", "close", "volume",
         "sma_5", "sma_20", "sma_50", "ema_9", "ema_21",
@@ -143,7 +114,7 @@ def sync_gold_to_timescale(spark, batch_mode=False):
         "daily_return", "volatility_5m", "market_phase", "price_change_pct", "computed_at"
     ]
     
-    # Select only columns that exist in both DataFrame and TimescaleDB
+    # Filter columns
     available_columns = [col for col in timescale_columns if col in df_gold.columns]
     df_gold = df_gold.select(*available_columns)
     
@@ -154,7 +125,7 @@ def sync_gold_to_timescale(spark, batch_mode=False):
         print("No Gold records to sync")
         return
     
-    # JDBC connection properties
+    # JDBC Config
     jdbc_url = f"jdbc:postgresql://{TIMESCALE_HOST}:{TIMESCALE_PORT}/{TIMESCALE_DB}"
     connection_properties = {
         "user": TIMESCALE_USER,
@@ -164,26 +135,33 @@ def sync_gold_to_timescale(spark, batch_mode=False):
         "reWriteBatchedInserts": "true"
     }
     
-    # Write to TimescaleDB using DELETE + INSERT to avoid duplicates
-    print(f"Writing Gold data to TimescaleDB: {jdbc_url}")
+    staging_table = "gold_stocks_staging"
     
-    from pyspark.sql import functions as F
+    # Deduplicate data based on unique keys (symbol, ts) to prevent cardinality violations during UPSERT
+    # This keeps the first occurrence and drops duplicates within the batch
+    print("Deduplicating records by (symbol, ts)...")
+    df_gold = df_gold.dropDuplicates(['symbol', 'ts'])
     
-    # Get time range of data being synced
-    time_range = df_gold.agg(
-        F.min("ts").alias("min_ts"),
-        F.max("ts").alias("max_ts")
-    ).collect()[0]
+    # Recount after deduplication
+    dedup_count = df_gold.count()
+    if dedup_count < total_records:
+        print(f"⚠ Found and dropped {total_records - dedup_count} duplicate records. New count: {dedup_count}")
     
-    min_ts = time_range["min_ts"]
-    max_ts = time_range["max_ts"]
+    print(f"Writing {dedup_count} records to staging table: {staging_table}")
     
-    print(f"Syncing Gold data from {min_ts} to {max_ts}")
-    
-    # Delete existing records in this time range to avoid duplicates
-    # Use direct PostgreSQL connection to delete (avoids table drop issues with views)
+    # 1. Write to Staging Table (Overwrite)
     try:
-        print("Deleting existing Gold records in time range to avoid duplicates...")
+        df_gold.write \
+            .mode("overwrite") \
+            .jdbc(url=jdbc_url, table=staging_table, properties=connection_properties)
+        print(f"✓ Staging table loaded")
+    except Exception as e:
+        print(f"✗ Failed to write to staging table: {e}")
+        raise e
+
+    # 2. Perform UPSERT from Staging to Target
+    print("Performing UPSERT from Staging to Target...")
+    try:
         conn = psycopg2.connect(
             host=TIMESCALE_HOST,
             port=TIMESCALE_PORT,
@@ -193,75 +171,40 @@ def sync_gold_to_timescale(spark, batch_mode=False):
         )
         cursor = conn.cursor()
         
-        # Delete records in the time range
-        delete_query = """
-            DELETE FROM gold_stocks 
-            WHERE ts >= %s AND ts <= %s
+        # Build UPSERT Query dynamically based on available columns
+        # DO UPDATE SET col = EXCLUDED.col
+        update_cols = [col for col in available_columns if col not in ['symbol', 'ts']]
+        update_clause = ", ".join([f"{col} = EXCLUDED.{col}" for col in update_cols])
+        columns_str = ", ".join(available_columns)
+        
+        upsert_query = f"""
+            INSERT INTO gold_stocks ({columns_str})
+            SELECT {columns_str} FROM {staging_table}
+            ON CONFLICT (symbol, ts) 
+            DO UPDATE SET {update_clause};
         """
-        cursor.execute(delete_query, (min_ts, max_ts))
-        deleted_count = cursor.rowcount
+        
+        cursor.execute(upsert_query)
+        upsert_count = cursor.rowcount
         conn.commit()
         
-        print(f"✓ Deleted {deleted_count} existing Gold records in time range [{min_ts}, {max_ts}]")
+        print(f"✓ Successfully UPSERTED {upsert_count} records into gold_stocks")
+        
+        # Cleanup
+        cursor.execute(f"DROP TABLE IF EXISTS {staging_table}")
+        conn.commit()
+        print("✓ Staging table cleaned up")
+        
         cursor.close()
         conn.close()
         
-    except ImportError:
-        print("⚠️ psycopg2 not available, using Spark JDBC fallback...")
-        # Fallback: use Spark to read, filter, and write back
-        try:
-            existing_df = spark.read.jdbc(
-                url=jdbc_url,
-                table="gold_stocks",
-                properties=connection_properties
-            )
-            existing_outside_range = existing_df.filter(
-                (F.col("ts") < F.lit(min_ts)) | (F.col("ts") > F.lit(max_ts))
-            )
-            # Note: This approach requires overwrite which may fail due to views
-            # But it's a fallback if psycopg2 is not available
-            print("⚠️ Using Spark-based merge (may fail if table has dependent views)...")
-            final_df = existing_outside_range.unionByName(df_gold, allowMissingColumns=True)
-            final_df.write.mode("overwrite").jdbc(
-                url=jdbc_url, 
-                table="gold_stocks", 
-                properties=connection_properties
-            )
-            print(f"✓ Merged records using Spark fallback")
-            return  # Exit early since we already wrote the data
-        except Exception as e2:
-            print(f"⚠️ Spark fallback also failed: {e2}")
-            print("⚠️ Attempting direct append (may fail with duplicates)...")
     except Exception as e:
-        error_str = str(e).lower()
-        if "does not exist" in error_str or "relation" in error_str:
-            print(f"⚠️ Table may not exist yet: {e}")
-            print("⚠️ Continuing with append (will create table if needed)...")
-        else:
-            print(f"⚠️ Could not delete existing records: {e}")
-            print("⚠️ Continuing with append (may fail with duplicates)...")
+        print(f"✗ Error performing UPSERT: {e}")
+        raise e
     
-    # Now append the new records (no duplicates since we deleted them)
-    try:
-        df_gold.write \
-            .mode("append") \
-            .jdbc(url=jdbc_url, table="gold_stocks", properties=connection_properties)
-        print(f"✓ Successfully synced {total_records} Gold records to TimescaleDB")
-    except Exception as e:
-        # If append still fails (e.g., duplicates still exist), try to handle it
-        error_str = str(e)
-        if "duplicate key" in error_str.lower() or "unique constraint" in error_str.lower():
-            print(f"⚠️ Duplicate key error detected. Attempting to use ON CONFLICT DO UPDATE...")
-            # For now, re-raise the error with a helpful message
-            raise Exception(
-                f"Duplicate key error: Records in time range [{min_ts}, {max_ts}] still exist. "
-                f"Please ensure DELETE operation completed successfully. Original error: {e}"
-            )
-        else:
-            raise
-    
-    # Also sync to silver_stocks if needed
-    sync_silver_to_timescale(spark, batch_mode)
+    # Sync Silver (Optional: could implement similar logic if needed, keeping current for now)
+    # User requested removal as silver_cleaning.py handles this streaming sync
+    # sync_silver_to_timescale(spark, batch_mode)
 
 
 def sync_silver_to_timescale(spark, batch_mode=False):

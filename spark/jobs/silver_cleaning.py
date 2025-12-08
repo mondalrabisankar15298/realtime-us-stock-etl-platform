@@ -28,6 +28,13 @@ from config import (
     CHECKPOINT_PATH_SILVER,
 )
 
+# Configuration for TimescaleDB
+TIMESCALE_HOST = "postgres-timescale"
+TIMESCALE_PORT = "5432"
+TIMESCALE_DB = "stockdata"
+TIMESCALE_USER = "grafana"
+TIMESCALE_PASSWORD = "grafana"
+
 # Optional: change these if you want periodic idle prints
 IDLE_PRINT_EVERY = 0  # 0 = never print idle batches; set >0 to print heartbeat every N idle batches
 
@@ -161,7 +168,52 @@ def _merge_to_silver(spark, valid_df, batchId, valid_count):
     except Exception as e:
         print(f"[batch {batchId}][error] MERGE failed: {e}")
         traceback.print_exc()
+        traceback.print_exc()
         raise
+
+def write_to_timescale(batch_df, batch_id):
+    """
+    Write micro-batch to TimescaleDB
+    """
+    try:
+        # Optimistic count check
+        count = batch_df.count()
+        if count == 0:
+            return
+
+        jdbc_url = f"jdbc:postgresql://{TIMESCALE_HOST}:{TIMESCALE_PORT}/{TIMESCALE_DB}"
+
+        connection_properties = {
+            "user": TIMESCALE_USER,
+            "password": TIMESCALE_PASSWORD,
+            "driver": "org.postgresql.Driver",
+            "batchsize": "5000",
+            "reWriteBatchedInserts": "true"
+        }
+
+        # Select only necessary columns for DB
+        # Ensure columns match what's expected in the DB schema
+        db_df = batch_df.select(
+            "ts",
+            "symbol",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume"
+        )
+
+        # Append to TimescaleDB
+        db_df.write \
+            .mode("append") \
+            .jdbc(url=jdbc_url, table="silver_stocks", properties=connection_properties)
+        
+        print(f"[batch {batch_id}] Synced {count} rows to TimescaleDB")
+
+    except Exception as e:
+        print(f"[batch {batch_id}][warning] TimescaleDB sync failed: {e}")
+        # trace but do not fail the main stream
+        # traceback.print_exc()
 
 def upsert_to_silver(microBatchDF, batchId):
     """
@@ -213,11 +265,15 @@ def upsert_to_silver(microBatchDF, batchId):
         else:
             try:
                 valid_df.write.format("delta").mode("append").partitionBy("ingestion_date").save(DELTA_PATH_SILVER)
+                valid_df.write.format("delta").mode("append").partitionBy("ingestion_date").save(DELTA_PATH_SILVER)
                 print(f"[batch {batchId}] Silver table created and wrote {valid_count} rows (initial write)")
             except Exception as e:
                 print(f"[batch {batchId}][error] initial Silver write failed: {e}")
                 traceback.print_exc()
                 raise
+
+        # --- DUAL WRITE: Sync to TimescaleDB for Real-Time Dashboard ---
+        write_to_timescale(valid_df, batchId)
 
         dur_ms = int((time.time() - t0) * 1000)
         # print compact per-batch summary

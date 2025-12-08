@@ -109,6 +109,40 @@ def sync_gold_to_timescale(spark, batch_mode=False):
             print("   Batch mode requires truncation. Aborting sync.")
             return
 
+    # Calculate time range for the current batch
+    from pyspark.sql import functions as F
+    time_stats = df_gold.agg(F.min("ts").alias("min_ts"), F.max("ts").alias("max_ts")).collect()[0]
+    min_ts = time_stats["min_ts"]
+    max_ts = time_stats["max_ts"]
+    
+    print(f"Syncing Gold data from {min_ts} to {max_ts}")
+    
+    # "Smart Sync": Delete existing records in this time range to avoid duplicates
+    try:
+        import psycopg2
+        conn = psycopg2.connect(
+            host=TIMESCALE_HOST,
+            port=TIMESCALE_PORT,
+            database=TIMESCALE_DB,
+            user=TIMESCALE_USER,
+            password=TIMESCALE_PASSWORD
+        )
+        cursor = conn.cursor()
+        
+        print(f"Deleting existing Gold records in time range to avoid duplicates...")
+        delete_query = "DELETE FROM gold_stocks WHERE ts >= %s AND ts <= %s"
+        cursor.execute(delete_query, (min_ts, max_ts))
+        deleted_count = cursor.rowcount
+        conn.commit()
+        
+        print(f"✓ Deleted {deleted_count} existing Gold records in time range [{min_ts}, {max_ts}]")
+        cursor.close()
+        conn.close()
+        
+    except Exception as e:
+        print(f"⚠ Warning: Could not delete existing records: {e}")
+        print("Proceeding with append... (might fail with duplicates)")
+
     # Write data
     df_gold.write \
         .mode("append") \
@@ -117,7 +151,7 @@ def sync_gold_to_timescale(spark, batch_mode=False):
     print(f"✓ Successfully synced {total_records} records to TimescaleDB")
     
     # Also sync to silver_stocks if needed
-    sync_silver_to_timescale(spark, batch_mode)
+    # sync_silver_to_timescale(spark, batch_mode) # DISABLED: Handled by dedicated streaming job spark-timescale-sync
 
 
 def sync_silver_to_timescale(spark, batch_mode=False):

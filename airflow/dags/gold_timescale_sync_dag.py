@@ -64,6 +64,7 @@ def run_gold_spark_job(**context):
             'docker', 'exec', 'spark-master',
             'spark-submit',
             '--master', 'local[*]',
+            '--driver-memory', '1g',
             '--jars', '/opt/spark/jars/delta-core_2.12-2.4.0.jar,/opt/spark/jars/delta-storage-2.4.0.jar,/opt/spark/jars/postgresql-42.6.0.jar',
             '--conf', 'spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension',
             '--conf', 'spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog',
@@ -72,7 +73,7 @@ def run_gold_spark_job(**context):
         ]
 
         print(f"Running Gold job command: {' '.join(cmd)}")
-        print(f"Timeout set to: 60 seconds (job should complete in ~10 seconds)")
+        print(f"Timeout set to: 300 seconds (job should complete in ~10-30 seconds)")
 
         try:
             # Run command with captured output - job completes in ~10 seconds
@@ -81,7 +82,7 @@ def run_gold_spark_job(**context):
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=60,  # 1 minute timeout (job should complete in ~10 seconds)
+                timeout=300,  # 5 minute timeout (job usually completes quickly but allows for startup overhead)
                 check=False
             )
             
@@ -99,12 +100,12 @@ def run_gold_spark_job(**context):
                 raise subprocess.CalledProcessError(result.returncode, cmd, result.stdout, result.stderr)
                 
         except subprocess.TimeoutExpired as e:
-            print(f"✗ Gold job timed out after 60 seconds")
+            print(f"✗ Gold job timed out after 300 seconds")
             if hasattr(e, 'stdout') and e.stdout:
                 print(f"Output so far: {e.stdout[-2000:]}")
             if hasattr(e, 'stderr') and e.stderr:
                 print(f"Errors so far: {e.stderr[-2000:]}")
-            raise Exception(f"Gold job timed out after 60 seconds.")
+            raise Exception(f"Gold job timed out after 300 seconds.")
 
         print("✓ Gold layer processing completed!")
         if result.returncode == 137:
@@ -138,7 +139,7 @@ spark.stop()
             capture_output=True,
             text=True,
             check=True,
-            timeout=30
+            timeout=120  # 2 minutes timeout for verification (Spark startup can be slow)
         )
 
         record_count = 0
@@ -266,7 +267,7 @@ def verify_sync_results(**context):
             capture_output=True,
             text=True,
             check=True,
-            timeout=30
+            timeout=120
         )
 
         print("TimescaleDB verification:")
@@ -306,7 +307,7 @@ spark.stop()
             capture_output=True,
             text=True,
             check=True,
-            timeout=30
+            timeout=120
         )
 
         print("Delta Lake verification:")
@@ -325,7 +326,7 @@ gold_job_task = PythonOperator(
     task_id='run_gold_spark_job',
     python_callable=run_gold_spark_job,
     dag=dag,
-    execution_timeout=timedelta(minutes=2),  # 2 minutes (job completes in ~10 seconds, but buffer for safety)
+    execution_timeout=timedelta(minutes=10),  # 10 minutes (allow ample time for Spark startup)
 )
 
 timescale_sync_task = PythonOperator(
