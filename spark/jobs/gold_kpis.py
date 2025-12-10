@@ -78,89 +78,267 @@ def calculate_technical_indicators(df):
     return df_prepared
 
 
+
+    
+
+    
 def calculate_technical_indicators_batch(df):
     """
-    Calculate technical indicators in batch mode - PRESERVE TIME-SERIES STRUCTURE
-    Processes each (symbol, ts) record and adds technical indicators
+    Calculate technical indicators in batch mode using PySpark Native UDFs on Arrays.
+    This avoids Pandas UDFs while handling recursive calculations (EMA, MACD) efficiently.
+    Strategy: GroupBy Symbol -> Collect List -> UDF(Array -> Array) -> Explode
     """
-    from pyspark.sql.window import Window
+    from pyspark.sql.types import ArrayType, DoubleType, StructType, StructField
+    
+    # --- Python Helper Functions (Pure Python, No Pandas) ---
+    def calculate_ema_series_py(values, span):
+        if not values: return []
+        alpha = 2.0 / (span + 1)
+        ema = []
+        # Initial EMA is usually SMA of first N or just first price
+        # Using first price for simplicity and convergence
+        curr = values[0] if values[0] is not None else 0.0
+        ema.append(curr)
+        for i in range(1, len(values)):
+             val = values[i]
+             if val is None: val = curr # Carry forward
+             curr = (val * alpha) + (curr * (1 - alpha))
+             ema.append(curr)
+        return ema
+        
+    def calculate_rsi_series_py(closes):
+        # ROI logic on list
+        period = 14
+        if len(closes) < period + 1: return [None] * len(closes)
+        
+        rsi = [None] * len(closes)
+        gains = []
+        losses = []
+        
+        # Calculate changes
+        for i in range(1, len(closes)):
+            change = closes[i] - closes[i-1]
+            if change > 0:
+                gains.append(change)
+                losses.append(0.0)
+            else:
+                gains.append(0.0)
+                losses.append(abs(change))
+        
+        # Initial Avg Gain/Loss (SMA)
+        avg_gain = sum(gains[:period]) / period
+        avg_loss = sum(losses[:period]) / period
+        
+        # First RSI
+        if avg_loss == 0:
+            rsi[period] = 100.0
+        else:
+            rs = avg_gain / avg_loss
+            rsi[period] = 100.0 - (100.0 / (1.0 + rs))
+            
+        # Wilder's Smoothing for subsequent
+        for i in range(period + 1, len(closes)):
+             # Index in gains/losses is i-1
+             current_gain = gains[i-1]
+             current_loss = losses[i-1]
+             
+             avg_gain = ((avg_gain * (period - 1)) + current_gain) / period
+             avg_loss = ((avg_loss * (period - 1)) + current_loss) / period
+             
+             if avg_loss == 0:
+                 rsi[i] = 100.0
+             else:
+                 rs = avg_gain / avg_loss
+                 rsi[i] = 100.0 - (100.0 / (1.0 + rs))
+        
+        return rsi
 
-    # Define window specifications for time-series calculations
-    # Partition by symbol, order by timestamp
-    symbol_window = Window.partitionBy("symbol").orderBy("ts").rowsBetween(-4, 0)  # 5 rows (current + 4 previous)
-    symbol_window_20 = Window.partitionBy("symbol").orderBy("ts").rowsBetween(-19, 0)  # 20 rows
-    symbol_window_50 = Window.partitionBy("symbol").orderBy("ts").rowsBetween(-49, 0)  # 50 rows
+    # UDF Definition
+    # Input: sorted lists of numeric data
+    # Output: Struct of lists
+    output_schema = StructType([
+        StructField("ema_9", ArrayType(DoubleType())),
+        StructField("ema_21", ArrayType(DoubleType())),
+        StructField("rsi_14", ArrayType(DoubleType())),
+        StructField("macd", ArrayType(DoubleType())),
+        StructField("macd_signal", ArrayType(DoubleType())),
+        StructField("macd_histogram", ArrayType(DoubleType())),
+        StructField("atr_14", ArrayType(DoubleType())),
+        StructField("market_phase", ArrayType(StringType())),
+        StructField("sorted_indices", ArrayType(IntegerType())) # To verify order
+    ])
+
+    @F.udf(returnType=output_schema)
+    def compute_indicators_udf(ts_list, close_list, high_list, low_list, ema9_pd_placeholder):
+        # 1. Sort by timestamp strictly inside UDF
+        data = sorted(zip(ts_list, close_list, high_list, low_list, range(len(ts_list))), key=lambda x: x[0])
+        ts_sorted, closes, highs, lows, indices = zip(*data)
+        
+        n = len(closes)
+        
+        # EMA
+        ema9 = calculate_ema_series_py(closes, 9)
+        ema21 = calculate_ema_series_py(closes, 21)
+        
+        # MACD
+        ema12 = calculate_ema_series_py(closes, 12)
+        ema26 = calculate_ema_series_py(closes, 26)
+        macd_line = [(e12 - e26) if e12 is not None and e26 is not None else None for e12, e26 in zip(ema12, ema26)]
+        
+        # Signal Line (EMA 9 of MACD)
+        # Handle None in macd_line for initial values
+        # We can fill None with 0.0 or skip
+        valid_macd = [m if m is not None else 0.0 for m in macd_line]
+        macd_signal = calculate_ema_series_py(valid_macd, 9)
+        macd_hist = [(m - s) for m, s in zip(valid_macd, macd_signal)]
+        
+        # RSI
+        rsi14 = calculate_rsi_series_py(closes)
+        
+        # ATR (14)
+        # TR = Max(H-L, |H-Cp|, |L-Cp|)
+        tr_list = []
+        tr_list.append(highs[0] - lows[0]) # First TR is H-L
+        for i in range(1, n):
+            hl = highs[i] - lows[i]
+            h_cp = abs(highs[i] - closes[i-1])
+            l_cp = abs(lows[i] - closes[i-1])
+            tr_list.append(max(hl, h_cp, l_cp))
+            
+        # ATR is SMA of TR (or RMA) - using SMA for simplicity here matching Pandas Code
+        atr14 = [None] * n
+        if n > 14:
+            # Simple rolling mean
+            window_sum = sum(tr_list[:14])
+            atr14[13] = window_sum / 14
+            for i in range(14, n):
+                 window_sum = window_sum - tr_list[i-14] + tr_list[i]
+                 atr14[i] = window_sum / 14
+        
+        # Market Phase
+        phases = []
+        for i in range(n):
+            c = closes[i]
+            e9 = ema9[i]
+            e21 = ema21[i]
+            if c is None or e9 is None or e21 is None:
+                phases.append("unknown")
+            elif c > e9 and e9 > e21:
+                phases.append("bullish")
+            elif c < e9 and e9 < e21:
+                phases.append("bearish")
+            else:
+                phases.append("consolidation")
+
+        return {
+            "ema_9": ema9,
+            "ema_21": ema21,
+            "rsi_14": rsi14,
+            "macd": macd_line,
+            "macd_signal": macd_signal,
+            "macd_histogram": macd_hist,
+            "atr_14": atr14,
+            "market_phase": phases,
+            "sorted_indices": indices 
+        }
+
+    # --- Spark Logic ---
     
-    # Start with the original time-series data from silver
-    gold_df = df.select(
+    # 1. Calculate Non-Recursive Indicators (SMA, Returns) using Standard Window functions
+    # (Existing logic is fine, we keep it)
+    symbol_window = Window.partitionBy("symbol").orderBy("ts").rowsBetween(-4, 0)
+    symbol_window_20 = Window.partitionBy("symbol").orderBy("ts").rowsBetween(-19, 0)
+    symbol_window_50 = Window.partitionBy("symbol").orderBy("ts").rowsBetween(-49, 0)
+    
+    gold_df = df.select("symbol", "ts", "open", "high", "low", "close", "volume")
+    
+    gold_df = gold_df.withColumn("sma_5", F.avg("close").over(symbol_window)) \
+                     .withColumn("sma_20", F.avg("close").over(symbol_window_20)) \
+                     .withColumn("sma_50", F.avg("close").over(symbol_window_50))
+    
+    # Daily Return logic...
+    prev_close_win = Window.partitionBy("symbol").orderBy("ts").rowsBetween(Window.unboundedPreceding, Window.currentRow - 1)
+    gold_df = gold_df.withColumn("prev_close", F.lag("close", 1).over(Window.partitionBy("symbol").orderBy("ts")))
+    gold_df = gold_df.withColumn("price_change_pct", 
+        F.when(F.col("prev_close").isNotNull(), ((F.col("close") - F.col("prev_close")) / F.col("prev_close")) * 100).otherwise(0.0)
+    )
+    gold_df = gold_df.withColumn("daily_return", F.col("price_change_pct"))
+    gold_df = gold_df.withColumn("volatility_5m", F.stddev("price_change_pct").over(symbol_window)) # Reuse window
+
+    # 2. VWAP (Cumulative Session) - Can be done with Window unboundedPreceding
+    # Partition by Day + Symbol. For now, assuming Global Cumulative for simplicity or single day batch.
+    # To do it properly native:
+    gold_df = gold_df.withColumn("day", F.to_date("ts"))
+    daily_window = Window.partitionBy("symbol", "day").orderBy("ts").rowsBetween(Window.unboundedPreceding, Window.currentRow)
+    
+    gold_df = gold_df.withColumn("cum_pv", F.sum(F.col("close") * F.col("volume")).over(daily_window))
+    gold_df = gold_df.withColumn("cum_vol", F.sum("volume").over(daily_window))
+    gold_df = gold_df.withColumn("vwap", F.when(F.col("cum_vol") == 0, F.col("close")).otherwise(F.col("cum_pv") / F.col("cum_vol")))
+    
+    # 3. Recursive Indicators via UDF (EMA, MACD, RSI, ATR, Phase)
+    # Collect lists
+    grouped = gold_df.groupBy("symbol").agg(
+        F.collect_list("ts").alias("ts_list"),
+        F.collect_list("close").alias("close_list"),
+        F.collect_list("high").alias("high_list"),
+        F.collect_list("low").alias("low_list")
+    )
+    
+    # Apply UDF
+    grouped_computed = grouped.withColumn("indicators", compute_indicators_udf(
+        "ts_list", "close_list", "high_list", "low_list", F.lit(None)
+    ))
+    
+    # Explode back
+    # indicators is a Struct of Arrays. We need to zip them all back.
+    # F.arrays_zip(ts_list, indicators.ema_9, ...)
+    
+    exploded = grouped_computed.select(
         "symbol",
-        "ts",
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume"
+        F.explode(F.arrays_zip(
+            F.col("ts_list"),
+            F.col("indicators.ema_9"),
+            F.col("indicators.ema_21"),
+            F.col("indicators.rsi_14"),
+            F.col("indicators.macd"),
+            F.col("indicators.macd_signal"),
+            F.col("indicators.macd_histogram"),
+            F.col("indicators.atr_14"),
+            F.col("indicators.market_phase")
+        )).alias("zipped")
+    ).select(
+        "symbol",
+        F.col("zipped.0").alias("ts"),
+        F.col("zipped.1").alias("ema_9"),
+        F.col("zipped.2").alias("ema_21"),
+        F.col("zipped.3").alias("rsi_14"),
+        F.col("zipped.4").alias("macd"),
+        F.col("zipped.5").alias("macd_signal"),
+        F.col("zipped.6").alias("macd_histogram"),
+        F.col("zipped.7").alias("atr_14"),
+        F.col("zipped.8").alias("market_phase")
     )
     
-    # Calculate Simple Moving Averages (SMA)
-    gold_df = gold_df.withColumn(
-        "sma_5", F.avg("close").over(symbol_window)
-    ).withColumn(
-        "sma_20", F.avg("close").over(symbol_window_20)
-    ).withColumn(
-        "sma_50", F.avg("close").over(symbol_window_50)
-    )
+    # Join back with original Windowed DF (SMA, VWAP)
+    # Join key: symbol, ts
+    # Warning: timestamps must match exactly. The UDF sorted them, so arrays_zip respects that order.
     
-    # Calculate price change and daily return
-    # Get previous close for return calculation
-    prev_close_window = Window.partitionBy("symbol").orderBy("ts").rowsBetween(Window.unboundedPreceding, Window.currentRow - 1)
-    gold_df = gold_df.withColumn(
-        "prev_close", F.lag("close", 1).over(Window.partitionBy("symbol").orderBy("ts"))
-    ).withColumn(
-        "price_change_pct", 
-        F.when(F.col("prev_close").isNotNull(), 
-               ((F.col("close") - F.col("prev_close")) / F.col("prev_close")) * 100)
-        .otherwise(None)
-    )
+    final_df = gold_df.join(exploded, ["symbol", "ts"], "inner")
     
-    # Calculate daily return (simplified - using price change)
-    gold_df = gold_df.withColumn(
-        "daily_return", F.col("price_change_pct")
-    )
+    # Add computed_at and formatting
+    final_df = final_df.withColumn("computed_at", F.current_timestamp())
     
-    # Calculate volatility (rolling standard deviation of returns)
-    return_window = Window.partitionBy("symbol").orderBy("ts").rowsBetween(-4, 0)  # 5-minute window
-    gold_df = gold_df.withColumn(
-        "volatility_5m", F.stddev("price_change_pct").over(return_window)
-    )
+    # Select Final Schema Columns
+    cols = [
+            "symbol", "ts", "close", "volume", 
+            "sma_5", "sma_20", "sma_50", 
+            "ema_9", "ema_21", "rsi_14", "vwap", 
+            "macd", "macd_signal", "macd_histogram", "atr_14", 
+            "daily_return", "volatility_5m", "market_phase", 
+            "price_change_pct", "computed_at"
+    ]
     
-    # Placeholder columns for future technical indicators (to be implemented)
-    gold_df = gold_df.withColumn(
-        "ema_9", F.lit(None).cast("double")
-    ).withColumn(
-        "ema_21", F.lit(None).cast("double")
-    ).withColumn(
-        "rsi_14", F.lit(None).cast("double")
-    ).withColumn(
-        "vwap", F.lit(None).cast("double")
-    ).withColumn(
-        "macd", F.lit(None).cast("double")
-    ).withColumn(
-        "macd_signal", F.lit(None).cast("double")
-    ).withColumn(
-        "macd_histogram", F.lit(None).cast("double")
-    ).withColumn(
-        "atr_14", F.lit(None).cast("double")
-    ).withColumn(
-        "market_phase", F.lit("unknown")
-    ).withColumn(
-        "computed_at", F.current_timestamp()
-    )
-    
-    # Drop helper column
-    gold_df = gold_df.drop("prev_close")
-    
-    return gold_df
+    return final_df.select(cols)
 
 
 def upsert_to_gold(microBatchDF, batchId):
@@ -314,11 +492,10 @@ def process_gold_stream(batch_mode=False):
             except Exception as e:
                 if attempt < max_retries - 1:
                     print(f"⚠ Error reading Silver table (attempt {attempt + 1}/{max_retries}): {e}")
-                    print(f"Waiting {retry_delay} seconds before retry...")
-                    time.sleep(retry_delay)
-                else:
                     raise
 
+        import gc
+        
         # Process Silver data
         print(f"\nProcessing {silver_count} rows from Silver table...")
 
@@ -337,6 +514,10 @@ def process_gold_stream(batch_mode=False):
         print("✓ Gold table created/updated successfully")
         print(f"Gold table location: {DELTA_PATH_GOLD}")
         print(f"Gold table contains {gold_df.count()} aggregated records")
+        
+        # Cleanup
+        spark.catalog.clearCache()
+        gc.collect()
 
         # If batch mode, exit after processing
         if batch_mode:
@@ -352,6 +533,10 @@ def process_gold_stream(batch_mode=False):
             time.sleep(300)  # Wait 5 minutes before reprocessing
             
             try:
+                # Cleanup before new iteration
+                spark.catalog.clearCache()
+                gc.collect()
+                
                 # Check if Silver table has new data
                 silver_df_new = (
                     spark.read
@@ -379,11 +564,18 @@ def process_gold_stream(batch_mode=False):
                     
                     silver_count = new_count
                     print(f"✓ Gold table updated successfully ({gold_df_new.count()} records)")
+                    
+                    # Cleanup after write
+                    gold_df_new.unpersist()
+                    spark.catalog.clearCache()
+                    gc.collect()
                 else:
                     print(f"✓ No new data detected (still {silver_count} rows)")
                     
             except Exception as e:
                 print(f"⚠ Error during periodic update: {e}")
+                import traceback
+                traceback.print_exc()
         
     except KeyboardInterrupt:
         print("\n\nStopping Gold KPI job...")

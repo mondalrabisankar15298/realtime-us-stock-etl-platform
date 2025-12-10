@@ -27,6 +27,7 @@ dag = DAG(
     description='Daily rebuild of Gold layer KPIs',
     schedule_interval='0 0 * * *',  # Daily at midnight UTC
     catchup=False,
+    is_paused_upon_creation=True,  # Start paused - manually enable when needed
     tags=['gold', 'rebuild', 'maintenance'],
 )
 

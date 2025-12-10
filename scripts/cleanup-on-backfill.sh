@@ -140,33 +140,51 @@ cleanup_delta_tables() {
 }
 
 # ==========================================
-# Function: Clean Spark Checkpoints
+# Function: Clean Spark and Polars Checkpoints
 # ==========================================
 cleanup_checkpoints() {
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "3. Cleaning Spark Checkpoints"
+    echo "3. Cleaning Spark & Polars Checkpoints"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     
     CHECKPOINT_BASE="/opt/spark/checkpoints"
     
+    # Clean Spark streaming checkpoints (directories)
     for layer in bronze silver gold; do
         CHECKPOINT_PATH="${CHECKPOINT_BASE}/${layer}"
         if [ -d "${CHECKPOINT_PATH}" ]; then
-            echo "   Removing ${layer} checkpoint: ${CHECKPOINT_PATH}"
+            echo "   Removing ${layer} Spark checkpoint: ${CHECKPOINT_PATH}"
             # Use find with -delete to handle permission issues better
             find "${CHECKPOINT_PATH}" -type f -delete 2>/dev/null || true
             find "${CHECKPOINT_PATH}" -type d -empty -delete 2>/dev/null || true
             rm -rf "${CHECKPOINT_PATH}" 2>/dev/null || true
             
             if [ ! -d "${CHECKPOINT_PATH}" ]; then
-                echo -e "   ${GREEN}✓ Removed ${layer} checkpoint${NC}"
+                echo -e "   ${GREEN}✓ Removed ${layer} Spark checkpoint${NC}"
             else
-                echo -e "   ${YELLOW}⚠ Partially cleaned ${layer} checkpoint (some files may remain)${NC}"
+                echo -e "   ${YELLOW}⚠ Partially cleaned ${layer} Spark checkpoint (some files may remain)${NC}"
             fi
         else
-            echo "   ${YELLOW}⚠ ${layer} checkpoint not found (already clean)${NC}"
+            echo "   ${YELLOW}⚠ ${layer} Spark checkpoint not found (already clean)${NC}"
         fi
     done
+    
+    # Clean Polars checkpoint JSON files
+    echo "   Removing Polars checkpoint JSON files..."
+    POLARS_CHECKPOINTS_REMOVED=0
+    for checkpoint_file in "${CHECKPOINT_BASE}"/*_checkpoint.json; do
+        if [ -f "${checkpoint_file}" ]; then
+            rm -f "${checkpoint_file}" 2>/dev/null || true
+            if [ ! -f "${checkpoint_file}" ]; then
+                echo -e "   ${GREEN}✓ Removed $(basename "${checkpoint_file}")${NC}"
+                POLARS_CHECKPOINTS_REMOVED=1
+            fi
+        fi
+    done
+    
+    if [ ${POLARS_CHECKPOINTS_REMOVED} -eq 0 ]; then
+        echo "   ${YELLOW}⚠ No Polars checkpoint JSON files found (already clean)${NC}"
+    fi
     
     echo -e "   ${GREEN}✓ All checkpoints cleaned${NC}"
     echo ""

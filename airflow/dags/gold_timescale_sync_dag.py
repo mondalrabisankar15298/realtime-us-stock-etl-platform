@@ -31,6 +31,7 @@ dag = DAG(
     schedule_interval='*/2 * * * *',  # Every 2 minutes
     catchup=False,
     max_active_runs=1,
+    is_paused_upon_creation=True,  # Start paused - manually enable when needed
     tags=['gold', 'timescaledb', 'sync', 'realtime'],
 )
 

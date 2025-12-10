@@ -30,6 +30,7 @@ dag = DAG(
     schedule_interval='*/1 * * * *',  # Every minute
     catchup=False,
     max_active_runs=1,
+    is_paused_upon_creation=True,  # Start paused - manually enable when needed
     tags=['stock', 'producer', 'real-time'],
 )
 

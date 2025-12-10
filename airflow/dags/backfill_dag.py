@@ -29,6 +29,7 @@ dag = DAG(
     description='Backfill historical stock data for detected gaps',
     schedule_interval=None,  # Manual trigger only
     catchup=False,
+    is_paused_upon_creation=True,  # Start paused - manually enable when needed
     tags=['stock', 'backfill', 'maintenance'],
 )
 

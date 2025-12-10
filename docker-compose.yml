@@ -74,21 +74,23 @@ services:
       dockerfile: Dockerfile.spark
     image: stock-etl-spark:latest
     container_name: spark-master
+    profiles: [ "spark" ]
     command: >
-      bash -c " /opt/spark/sbin/start-master.sh --host spark-master --port 7077 --webui-port 6004 & sleep 5 && /opt/spark/sbin/start-worker.sh spark://spark-master:7077 && tail -f /opt/spark/logs/*.out "
+      bash -c " /opt/spark/sbin/start-master.sh --host spark-master --port 7077 --webui-port 6004 & sleep 5 && /opt/spark/sbin/start-worker.sh spark://spark-master:7077 --work-dir /opt/spark/tmp && tail -f /opt/spark/logs/*.out "
     environment:
       - SPARK_MASTER_WEBUI_PORT=6004
       - SPARK_UI_PORT=4040
-      - SPARK_WORKER_MEMORY=6g # Optimized for 12GB total Docker limit
-      - SPARK_WORKER_CORES=6 # Increased for better parallelism (cores don't consume memory)
+      - SPARK_WORKER_MEMORY=4g # Optimized for 12GB total Docker limit
+      - SPARK_WORKER_CORES=6 # Keep cores high for parallelism
       - SPARK_SHUFFLE_SERVICE_ENABLED=false
+      - SPARK_LOCAL_DIR=/opt/spark/tmp
       - FORCE_BACKFILL=${FORCE_BACKFILL}
     deploy:
       resources:
         limits:
-          memory: 7g # Worker memory (6g) + overhead (1g)
+          memory: 5g # Worker memory (4g) + overhead (1g)
         reservations:
-          memory: 6g
+          memory: 4g
     ports:
       - "6004:6004"
       - "6005:7077"
@@ -98,6 +100,7 @@ services:
       - ./spark:/opt/spark-jobs
       - spark-delta-tables:/opt/spark/delta_tables
       - spark-checkpoints:/opt/spark/checkpoints
+      - ./spark/tmp:/opt/spark/tmp
     networks:
       - stock-etl-network
     healthcheck:
@@ -142,6 +145,10 @@ services:
       - timescale-data:/var/lib/postgresql/data
       - ./scripts/init-timescale.sql:/docker-entrypoint-initdb.d/01-init-timescale.sql
       - ./scripts/init-grafana.sql:/docker-entrypoint-initdb.d/02-init-grafana.sql
+    deploy:
+      resources:
+        limits:
+          memory: 1g
     ports:
       - "6008:5432"
     networks:
@@ -243,6 +250,10 @@ services:
         condition: service_completed_successfully
       postgres-airflow:
         condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 1g
     command: webserver
     healthcheck:
       test: [ "CMD", "curl", "--fail", "http://localhost:6009/health" ]
@@ -276,6 +287,10 @@ services:
         condition: service_healthy
       cleanup-init:
         condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          memory: 1g
     command: scheduler
     healthcheck:
       test: [ "CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"' ]
@@ -300,6 +315,7 @@ services:
       - ./producer/state:/app/state
       - spark-delta-tables:/opt/spark/delta_tables
       - spark-checkpoints:/opt/spark/checkpoints
+      - ./polars_etl/checkpoints:/opt/spark/checkpoints # Mount Polars checkpoints for cleanup
     networks:
       - stock-etl-network
     depends_on:
@@ -311,6 +327,40 @@ services:
         condition: service_healthy # Wait for Airflow DB to be healthy
     command: [ "/scripts/cleanup-on-backfill.sh" ]
     restart: "no"
+    profiles: [ "spark", "polars" ]
+
+  # ==========================================
+  # Polars ETL - Lightweight Mode
+  # ==========================================
+  polars-etl:
+    build:
+      context: ./polars_etl
+      dockerfile: Dockerfile
+    container_name: polars-etl
+    profiles: [ "polars" ]
+    environment:
+      - REDPANDA_BROKER=redpanda:9092
+      - KAFKA_TOPIC_RAW=${KAFKA_TOPIC_RAW}
+      - POSTGRES_GRAFANA_DB=${POSTGRES_GRAFANA_DB}
+      - POSTGRES_GRAFANA_USER=${POSTGRES_GRAFANA_USER}
+      - POSTGRES_GRAFANA_PASSWORD=${POSTGRES_GRAFANA_PASSWORD}
+    volumes:
+      - spark-delta-tables:/opt/spark/delta_tables
+      - ./polars_etl/checkpoints:/opt/spark/checkpoints # Persist checkpoint state
+    networks:
+      - stock-etl-network
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      postgres-timescale:
+        condition: service_healthy
+      cleanup-init:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+    restart: unless-stopped
 
   # ==========================================
   # Producer - Stock Data Ingestion
@@ -352,6 +402,7 @@ services:
     image: stock-etl-spark:latest
     pull_policy: never
     container_name: spark-bronze-job
+    profiles: [ "spark" ]
     environment:
       - SPARK_MASTER_URL=spark://spark-master:7077
       - SPARK_RPC_AUTHENTICATION_ENABLED=no
@@ -378,13 +429,14 @@ services:
         condition: service_healthy
       cleanup-init:
         condition: service_completed_successfully
-    command: [ "/bin/bash", "-c", " echo 'Waiting for Spark master...' && sleep 30 && echo 'Starting Bronze Layer Ingestion...' && /opt/spark/bin/spark-submit --master spark://spark-master:7077 --jars /opt/spark/jars/delta-core_2.12-2.4.0.jar,/opt/spark/jars/delta-storage-2.4.0.jar,/opt/spark/jars/spark-sql-kafka-0-10_2.12-3.4.1.jar,/opt/spark/jars/spark-token-provider-kafka-0-10_2.12-3.4.0.jar,/opt/spark/jars/kafka-clients-3.4.0.jar,/opt/spark/jars/commons-pool2-2.11.1.jar --conf spark.sql.streaming.checkpointLocation.checkpointSchema=true --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog --conf spark.dynamicAllocation.enabled=true --conf spark.dynamicAllocation.minExecutors=1 --conf spark.dynamicAllocation.maxExecutors=2 --conf spark.dynamicAllocation.initialExecutors=1 --conf spark.dynamicAllocation.executorIdleTimeout=30s --conf spark.executor.cores=2 --conf spark.executor.memory=1g --conf spark.driver.memory=512m --conf spark.driver.cores=1 /opt/spark-jobs/jobs/bronze_ingestion.py " ]
+    command: [ "/bin/bash", "-c", " echo 'Waiting for Spark master...' && sleep 30 && echo 'Starting Bronze Layer Ingestion...' && /opt/spark/bin/spark-submit --master spark://spark-master:7077 --jars /opt/spark/jars/delta-core_2.12-2.4.0.jar,/opt/spark/jars/delta-storage-2.4.0.jar,/opt/spark/jars/spark-sql-kafka-0-10_2.12-3.4.1.jar,/opt/spark/jars/spark-token-provider-kafka-0-10_2.12-3.4.0.jar,/opt/spark/jars/kafka-clients-3.4.0.jar,/opt/spark/jars/commons-pool2-2.11.1.jar --conf spark.sql.streaming.checkpointLocation.checkpointSchema=true --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog --conf spark.dynamicAllocation.enabled=true --conf spark.dynamicAllocation.minExecutors=1 --conf spark.dynamicAllocation.maxExecutors=2 --conf spark.dynamicAllocation.initialExecutors=1 --conf spark.dynamicAllocation.executorIdleTimeout=30s --conf spark.executor.cores=2 --conf spark.executor.memory=1g --conf spark.driver.memory=512m --conf spark.driver.cores=1 --conf spark.sql.shuffle.partitions=10 --conf spark.cleaner.periodicGC.enabled=true /opt/spark-jobs/jobs/bronze_ingestion.py " ]
     restart: unless-stopped
 
   spark-silver:
     image: stock-etl-spark:latest
     pull_policy: never
     container_name: spark-silver-job
+    profiles: [ "spark" ]
     environment:
       - SPARK_MASTER_URL=spark://spark-master:7077
       - SPARK_RPC_AUTHENTICATION_ENABLED=no
@@ -408,7 +460,7 @@ services:
         condition: service_started
       cleanup-init:
         condition: service_completed_successfully
-    command: [ "/bin/bash", "-c", " echo 'Waiting for Bronze layer to initialize...' && sleep 60 && echo 'Starting Silver Layer Cleaning...' && /opt/spark/bin/spark-submit --master spark://spark-master:7077 --jars /opt/spark/jars/delta-core_2.12-2.4.0.jar,/opt/spark/jars/delta-storage-2.4.0.jar,/opt/spark/jars/postgresql-42.6.0.jar --conf spark.sql.streaming.checkpointLocation.checkpointSchema=true --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog --conf spark.dynamicAllocation.enabled=true --conf spark.dynamicAllocation.minExecutors=1 --conf spark.dynamicAllocation.maxExecutors=2 --conf spark.executor.memory=1g --conf spark.executor.cores=2 --conf spark.driver.memory=512m --conf spark.driver.cores=1 /opt/spark-jobs/jobs/silver_cleaning.py " ]
+    command: [ "/bin/bash", "-c", " echo 'Waiting for Bronze layer to initialize...' && sleep 60 && echo 'Starting Silver Layer Cleaning...' && /opt/spark/bin/spark-submit --master spark://spark-master:7077 --jars /opt/spark/jars/delta-core_2.12-2.4.0.jar,/opt/spark/jars/delta-storage-2.4.0.jar,/opt/spark/jars/postgresql-42.6.0.jar --conf spark.sql.streaming.checkpointLocation.checkpointSchema=true --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog --conf spark.dynamicAllocation.enabled=true --conf spark.dynamicAllocation.minExecutors=1 --conf spark.dynamicAllocation.maxExecutors=2 --conf spark.executor.memory=1g --conf spark.executor.cores=2 --conf spark.driver.memory=512m --conf spark.driver.cores=1 --conf spark.sql.shuffle.partitions=10 --conf spark.cleaner.periodicGC.enabled=true /opt/spark-jobs/jobs/silver_cleaning.py " ]
     restart: unless-stopped
 
   # ==========================================

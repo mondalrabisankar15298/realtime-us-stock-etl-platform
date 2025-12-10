@@ -1,0 +1,795 @@
+{
+    "annotations": {
+        "list": [
+            {
+                "builtIn": 1,
+                "datasource": "-- Grafana --",
+                "enable": true,
+                "hide": true,
+                "iconColor": "rgba(0, 211, 255, 1)",
+                "name": "Annotations & Alerts",
+                "type": "dashboard"
+            }
+        ]
+    },
+    "editable": true,
+    "gnetId": null,
+    "graphTooltip": 1,
+    "id": null,
+    "links": [],
+    "panels": [
+        {
+            "collapsed": false,
+            "gridPos": {
+                "h": 1,
+                "w": 24,
+                "x": 0,
+                "y": 0
+            },
+            "id": 100,
+            "panels": [],
+            "title": "📊 Real-Time Overview",
+            "type": "row"
+        },
+        {
+            "datasource": "StockData-TimescaleDB",
+            "fieldConfig": {
+                "defaults": {
+                    "color": {
+                        "mode": "thresholds"
+                    },
+                    "thresholds": {
+                        "mode": "absolute",
+                        "steps": [
+                            {
+                                "color": "green",
+                                "value": null
+                            }
+                        ]
+                    },
+                    "unit": "none",
+                    "decimals": 3
+                }
+            },
+            "gridPos": {
+                "h": 4,
+                "w": 4,
+                "x": 0,
+                "y": 1
+            },
+            "id": 1,
+            "options": {
+                "colorMode": "value",
+                "graphMode": "area",
+                "reduceOptions": {
+                    "calcs": [
+                        "lastNotNull"
+                    ]
+                }
+            },
+            "targets": [
+                {
+                    "rawQuery": true,
+                    "rawSql": "SELECT close FROM silver_stocks WHERE symbol = '$symbol' ORDER BY ts DESC LIMIT 1",
+                    "refId": "A",
+                    "format": "table"
+                }
+            ],
+            "title": "💰 Latest Price",
+            "type": "stat"
+        },
+        {
+            "datasource": "StockData-TimescaleDB",
+            "fieldConfig": {
+                "defaults": {
+                    "color": {
+                        "mode": "thresholds"
+                    },
+                    "thresholds": {
+                        "mode": "absolute",
+                        "steps": [
+                            {
+                                "color": "red",
+                                "value": null
+                            },
+                            {
+                                "color": "green",
+                                "value": 0
+                            }
+                        ]
+                    },
+                    "unit": "percent",
+                    "decimals": 2
+                }
+            },
+            "gridPos": {
+                "h": 4,
+                "w": 4,
+                "x": 4,
+                "y": 1
+            },
+            "id": 2,
+            "options": {
+                "colorMode": "value",
+                "graphMode": "none",
+                "reduceOptions": {
+                    "calcs": [
+                        "lastNotNull"
+                    ]
+                }
+            },
+            "targets": [
+                {
+                    "rawQuery": true,
+                    "rawSql": "SELECT ((last(close, ts) - first(close, ts)) / first(close, ts) * 100) as pct_change FROM silver_stocks WHERE symbol = '$symbol' AND $__timeFilter(ts)",
+                    "refId": "A",
+                    "format": "table"
+                }
+            ],
+            "title": "📈 Change %",
+            "type": "stat"
+        },
+        {
+            "datasource": "StockData-TimescaleDB",
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "short"
+                }
+            },
+            "gridPos": {
+                "h": 4,
+                "w": 4,
+                "x": 8,
+                "y": 1
+            },
+            "id": 3,
+            "options": {
+                "colorMode": "value",
+                "graphMode": "area",
+                "reduceOptions": {
+                    "calcs": [
+                        "lastNotNull"
+                    ]
+                }
+            },
+            "targets": [
+                {
+                    "rawQuery": true,
+                    "rawSql": "SELECT SUM(volume) as volume FROM silver_stocks WHERE symbol = '$symbol' AND $__timeFilter(ts)",
+                    "refId": "A",
+                    "format": "table"
+                }
+            ],
+            "title": "📊 Volume",
+            "type": "stat"
+        },
+        {
+            "datasource": "StockData-TimescaleDB",
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "none",
+                    "decimals": 3
+                }
+            },
+            "gridPos": {
+                "h": 4,
+                "w": 4,
+                "x": 12,
+                "y": 1
+            },
+            "id": 4,
+            "options": {
+                "colorMode": "value",
+                "graphMode": "none",
+                "reduceOptions": {
+                    "calcs": [
+                        "lastNotNull"
+                    ]
+                }
+            },
+            "targets": [
+                {
+                    "rawQuery": true,
+                    "rawSql": "SELECT (MAX(high) - MIN(low)) as range FROM silver_stocks WHERE symbol = '$symbol' AND $__timeFilter(ts)",
+                    "refId": "A",
+                    "format": "table"
+                }
+            ],
+            "title": "📏 High-Low Range",
+            "type": "stat"
+        },
+        {
+            "datasource": "StockData-TimescaleDB",
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "dateTimeFromNow"
+                }
+            },
+            "gridPos": {
+                "h": 4,
+                "w": 4,
+                "x": 16,
+                "y": 1
+            },
+            "id": 5,
+            "options": {
+                "colorMode": "value",
+                "graphMode": "none",
+                "reduceOptions": {
+                    "calcs": [
+                        "lastNotNull"
+                    ],
+                    "fields": ""
+                }
+            },
+            "targets": [
+                {
+                    "rawQuery": true,
+                    "rawSql": "SELECT EXTRACT(EPOCH FROM ts) * 1000 as last_update FROM silver_stocks ORDER BY ts DESC LIMIT 1",
+                    "refId": "A",
+                    "format": "table"
+                }
+            ],
+            "title": "🕐 Last Update",
+            "type": "stat"
+        },
+        {
+            "datasource": "StockData-TimescaleDB",
+            "fieldConfig": {
+                "defaults": {
+                    "color": {
+                        "mode": "thresholds"
+                    },
+                    "thresholds": {
+                        "mode": "absolute",
+                        "steps": [
+                            {
+                                "color": "green",
+                                "value": null
+                            },
+                            {
+                                "color": "yellow",
+                                "value": 5
+                            },
+                            {
+                                "color": "red",
+                                "value": 10
+                            }
+                        ]
+                    }
+                }
+            },
+            "gridPos": {
+                "h": 4,
+                "w": 4,
+                "x": 20,
+                "y": 1
+            },
+            "id": 6,
+            "options": {
+                "colorMode": "value",
+                "graphMode": "none",
+                "reduceOptions": {
+                    "calcs": [
+                        "lastNotNull"
+                    ]
+                }
+            },
+            "targets": [
+                {
+                    "rawQuery": true,
+                    "rawSql": "SELECT COUNT(*) as dlq_count FROM dlq_logs WHERE timestamp >= NOW() - INTERVAL '1 hour'",
+                    "refId": "A",
+                    "format": "table"
+                }
+            ],
+            "title": "⚠️ DLQ (1h)",
+            "type": "stat"
+        },
+        {
+            "collapsed": false,
+            "gridPos": {
+                "h": 1,
+                "w": 24,
+                "x": 0,
+                "y": 5
+            },
+            "id": 101,
+            "panels": [],
+            "title": "📈 Price Action & Volume",
+            "type": "row"
+        },
+        {
+            "datasource": "StockData-TimescaleDB",
+            "fieldConfig": {
+                "defaults": {
+                    "custom": {
+                        "drawStyle": "candlestick"
+                    },
+                    "unit": "none",
+                    "decimals": 3
+                }
+            },
+            "gridPos": {
+                "h": 10,
+                "w": 16,
+                "x": 0,
+                "y": 6
+            },
+            "id": 10,
+            "options": {
+                "legend": {
+                    "displayMode": "list",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "multi"
+                },
+                "candleStyle": {
+                    "upColor": "green",
+                    "downColor": "red",
+                    "wickColor": "gray"
+                }
+            },
+            "targets": [
+                {
+                    "rawQuery": true,
+                    "rawSql": "SELECT ts as time, open, high, low, close FROM silver_stocks WHERE symbol = '$symbol' AND $__timeFilter(ts) ORDER BY ts",
+                    "refId": "A",
+                    "format": "table"
+                }
+            ],
+            "title": "🕯️ Candlestick Chart ($symbol)",
+            "type": "candlestick"
+        },
+        {
+            "datasource": "StockData-TimescaleDB",
+            "fieldConfig": {
+                "defaults": {
+                    "custom": {
+                        "drawStyle": "bars",
+                        "fillOpacity": 50
+                    },
+                    "color": {
+                        "mode": "continuous-GrYlRd"
+                    }
+                }
+            },
+            "gridPos": {
+                "h": 10,
+                "w": 8,
+                "x": 16,
+                "y": 6
+            },
+            "id": 11,
+            "options": {
+                "legend": {
+                    "displayMode": "list",
+                    "placement": "bottom"
+                }
+            },
+            "targets": [
+                {
+                    "rawQuery": true,
+                    "rawSql": "SELECT ts as time, volume as value, 'Volume' as metric FROM silver_stocks WHERE symbol = '$symbol' AND $__timeFilter(ts) ORDER BY ts",
+                    "refId": "A",
+                    "format": "time_series"
+                }
+            ],
+            "title": "📊 Volume ($symbol)",
+            "type": "timeseries"
+        },
+        {
+            "datasource": "StockData-TimescaleDB",
+            "fieldConfig": {
+                "defaults": {
+                    "custom": {
+                        "drawStyle": "line",
+                        "fillOpacity": 10,
+                        "spanNulls": true
+                    },
+                    "unit": "none",
+                    "decimals": 3
+                }
+            },
+            "gridPos": {
+                "h": 8,
+                "w": 24,
+                "x": 0,
+                "y": 16
+            },
+            "id": 12,
+            "options": {
+                "legend": {
+                    "displayMode": "table",
+                    "placement": "right",
+                    "calcs": [
+                        "lastNotNull",
+                        "min",
+                        "max"
+                    ]
+                }
+            },
+            "targets": [
+                {
+                    "rawQuery": true,
+                    "rawSql": "SELECT ts as time, close as value, symbol as metric FROM silver_stocks WHERE $__timeFilter(ts) ORDER BY ts",
+                    "refId": "A",
+                    "format": "time_series"
+                }
+            ],
+            "title": "📊 All Stocks Comparison",
+            "type": "timeseries"
+        },
+        {
+            "collapsed": false,
+            "gridPos": {
+                "h": 1,
+                "w": 24,
+                "x": 0,
+                "y": 24
+            },
+            "id": 102,
+            "panels": [],
+            "title": "📉 Technical Indicators",
+            "type": "row"
+        },
+        {
+            "datasource": "StockData-TimescaleDB",
+            "fieldConfig": {
+                "defaults": {
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 2
+                    },
+                    "thresholds": {
+                        "mode": "absolute",
+                        "steps": [
+                            {
+                                "color": "green",
+                                "value": null
+                            },
+                            {
+                                "color": "red",
+                                "value": 70
+                            }
+                        ]
+                    },
+                    "min": 0,
+                    "max": 100
+                },
+                "overrides": [
+                    {
+                        "matcher": {
+                            "id": "byName",
+                            "options": "RSI"
+                        },
+                        "properties": [
+                            {
+                                "id": "color",
+                                "value": {
+                                    "mode": "fixed",
+                                    "fixedColor": "blue"
+                                }
+                            }
+                        ]
+                    }
+                ]
+            },
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 0,
+                "y": 25
+            },
+            "id": 20,
+            "options": {
+                "legend": {
+                    "displayMode": "list",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "multi"
+                }
+            },
+            "targets": [
+                {
+                    "rawQuery": true,
+                    "rawSql": "SELECT ts as time, rsi_14 as \"RSI\" FROM gold_stocks WHERE symbol = '$symbol' AND $__timeFilter(ts) AND rsi_14 IS NOT NULL ORDER BY ts",
+                    "refId": "A",
+                    "format": "time_series"
+                },
+                {
+                    "rawQuery": true,
+                    "rawSql": "SELECT ts as time, 70 as \"Overbought\" FROM gold_stocks WHERE symbol = '$symbol' AND $__timeFilter(ts) ORDER BY ts",
+                    "refId": "B",
+                    "format": "time_series"
+                },
+                {
+                    "rawQuery": true,
+                    "rawSql": "SELECT ts as time, 30 as \"Oversold\" FROM gold_stocks WHERE symbol = '$symbol' AND $__timeFilter(ts) ORDER BY ts",
+                    "refId": "C",
+                    "format": "time_series"
+                }
+            ],
+            "title": "📈 RSI (14) with Thresholds",
+            "type": "timeseries"
+        },
+        {
+            "datasource": "StockData-TimescaleDB",
+            "fieldConfig": {
+                "defaults": {
+                    "custom": {
+                        "drawStyle": "line"
+                    },
+                    "decimals": 4
+                }
+            },
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 12,
+                "y": 25
+            },
+            "id": 21,
+            "targets": [
+                {
+                    "rawQuery": true,
+                    "rawSql": "SELECT ts as time, macd, macd_signal, macd_histogram FROM gold_stocks WHERE symbol = '$symbol' AND $__timeFilter(ts) ORDER BY ts",
+                    "refId": "A",
+                    "format": "time_series"
+                }
+            ],
+            "title": "📊 MACD",
+            "type": "timeseries"
+        },
+        {
+            "collapsed": false,
+            "gridPos": {
+                "h": 1,
+                "w": 24,
+                "x": 0,
+                "y": 33
+            },
+            "id": 103,
+            "panels": [],
+            "title": "🏆 Market Overview & Performance",
+            "type": "row"
+        },
+        {
+            "datasource": "StockData-TimescaleDB",
+            "fieldConfig": {
+                "defaults": {
+                    "custom": {
+                        "align": "auto",
+                        "displayMode": "auto"
+                    },
+                    "thresholds": {
+                        "mode": "absolute",
+                        "steps": [
+                            {
+                                "color": "red",
+                                "value": null
+                            },
+                            {
+                                "color": "green",
+                                "value": 0
+                            }
+                        ]
+                    }
+                },
+                "overrides": [
+                    {
+                        "matcher": {
+                            "id": "byName",
+                            "options": "daily_return"
+                        },
+                        "properties": [
+                            {
+                                "id": "custom.displayMode",
+                                "value": "color-background-solid"
+                            },
+                            {
+                                "id": "decimals",
+                                "value": 2
+                            }
+                        ]
+                    },
+                    {
+                        "matcher": {
+                            "id": "byName",
+                            "options": "current_price"
+                        },
+                        "properties": [
+                            {
+                                "id": "decimals",
+                                "value": 3
+                            }
+                        ]
+                    }
+                ]
+            },
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 0,
+                "y": 34
+            },
+            "id": 30,
+            "options": {
+                "showHeader": true,
+                "footer": {
+                    "show": false
+                }
+            },
+            "targets": [
+                {
+                    "rawQuery": true,
+                    "rawSql": "SELECT symbol, current_price, daily_return, rsi_14, volume, movement_type FROM top_movers LIMIT 10",
+                    "refId": "A",
+                    "format": "table"
+                }
+            ],
+            "title": "🏆 Top Gainers & Losers",
+            "type": "table"
+        },
+        {
+            "datasource": "StockData-TimescaleDB",
+            "fieldConfig": {
+                "defaults": {
+                    "color": {
+                        "mode": "continuous-GrYlRd"
+                    },
+                    "thresholds": {
+                        "mode": "absolute",
+                        "steps": [
+                            {
+                                "color": "green",
+                                "value": null
+                            },
+                            {
+                                "color": "yellow",
+                                "value": 1
+                            },
+                            {
+                                "color": "red",
+                                "value": 3
+                            }
+                        ]
+                    }
+                }
+            },
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 12,
+                "y": 34
+            },
+            "id": 31,
+            "options": {
+                "orientation": "horizontal",
+                "displayMode": "gradient",
+                "reduceOptions": {
+                    "values": true,
+                    "calcs": [],
+                    "fields": "/.*/"
+                }
+            },
+            "targets": [
+                {
+                    "rawQuery": true,
+                    "rawSql": "SELECT symbol, COALESCE(volatility_5m, 0) as volatility FROM gold_stocks WHERE ts = (SELECT MAX(ts) FROM gold_stocks) ORDER BY volatility_5m DESC NULLS LAST",
+                    "refId": "A",
+                    "format": "table"
+                }
+            ],
+            "title": "🔥 Volatility Heatmap",
+            "type": "bargauge"
+        },
+        {
+            "datasource": "StockData-TimescaleDB",
+            "fieldConfig": {
+                "defaults": {
+                    "custom": {
+                        "align": "auto"
+                    }
+                },
+                "overrides": [
+                    {
+                        "matcher": {
+                            "id": "byName",
+                            "options": "signal"
+                        },
+                        "properties": [
+                            {
+                                "id": "custom.displayMode",
+                                "value": "color-background-solid"
+                            },
+                            {
+                                "id": "mappings",
+                                "value": [
+                                    {
+                                        "type": "value",
+                                        "options": {
+                                            "OVERBOUGHT": {
+                                                "color": "red",
+                                                "text": "🔴 OVERBOUGHT"
+                                            },
+                                            "OVERSOLD": {
+                                                "color": "green",
+                                                "text": "🟢 OVERSOLD"
+                                            },
+                                            "NEUTRAL": {
+                                                "color": "blue",
+                                                "text": "🔵 NEUTRAL"
+                                            }
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                ]
+            },
+            "gridPos": {
+                "h": 6,
+                "w": 24,
+                "x": 0,
+                "y": 42
+            },
+            "id": 32,
+            "options": {
+                "showHeader": true
+            },
+            "targets": [
+                {
+                    "rawQuery": true,
+                    "rawSql": "SELECT symbol, ts, close, rsi_14, signal FROM rsi_signals ORDER BY ts DESC LIMIT 20",
+                    "refId": "A",
+                    "format": "table"
+                }
+            ],
+            "title": "⚡ RSI Trading Signals (Last 24h)",
+            "type": "table"
+        }
+    ],
+    "refresh": "5s",
+    "schemaVersion": 36,
+    "style": "dark",
+    "tags": [
+        "stock",
+        "real-time",
+        "v3",
+        "advanced"
+    ],
+    "templating": {
+        "list": [
+            {
+                "current": {
+                    "selected": false,
+                    "text": "AAPL",
+                    "value": "AAPL"
+                },
+                "datasource": "StockData-TimescaleDB",
+                "definition": "SELECT DISTINCT symbol FROM silver_stocks ORDER BY symbol",
+                "hide": 0,
+                "includeAll": false,
+                "label": "Symbol",
+                "multi": false,
+                "name": "symbol",
+                "query": "SELECT DISTINCT symbol FROM silver_stocks ORDER BY symbol",
+                "refresh": 1,
+                "type": "query"
+            }
+        ]
+    },
+    "time": {
+        "from": "now-6h",
+        "to": "now"
+    },
+    "timepicker": {},
+    "timezone": "browser",
+    "title": "Real-Time Stock Market Dashboard V3",
+    "uid": "stock-market-dashboard-v3",
+    "version": 1
+}

@@ -28,6 +28,7 @@ dag = DAG(
     description='Data quality checks on Silver layer',
     schedule_interval='0 2 * * *',  # Daily at 2 AM
     catchup=False,
+    is_paused_upon_creation=True,  # Start paused - manually enable when needed
     tags=['quality', 'validation', 'monitoring'],
 )
 

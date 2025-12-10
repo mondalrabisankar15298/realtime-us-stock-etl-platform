@@ -37,6 +37,7 @@ dag = DAG(
     schedule_interval='*/5 * * * *',  # Every 5 minutes
     catchup=False,
     max_active_runs=1,
+    is_paused_upon_creation=True,  # Start paused - manually enable when needed
     tags=['etl', 'pipeline', 'orchestration', 'bronze', 'silver', 'gold'],
 )
 
