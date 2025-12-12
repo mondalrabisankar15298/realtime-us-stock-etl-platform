@@ -348,9 +348,92 @@ class StockDataProducer:
         if gap_seconds > (2.1 * 24 * 3600):
             return self._fetch_direct_yahoo_finance_incremental_catchup(ticker, last_timestamp)
 
-        start = last_timestamp - timedelta(seconds=10)
+        # Fetch a larger window (e.g. 15 mins) to ensure we get valid volume data
+        # Yahoo sometimes returns partial/zero data if the requested window is too narrow.
+        start = now - timedelta(minutes=15)
         end = now
         return self._fetch_direct_yahoo_finance_chunk(ticker, start, end, "1m")
+
+    def _fetch_daily_adjusted_closes(self, ticker: str, start_date: datetime, end_date: datetime) -> Dict[str, float]:
+        """
+        Fetches 1d data to get the definitive ANSWER KEY for what the price should be.
+        Returns a dict mapping 'YYYY-MM-DD' -> Adjusted Close Price (float).
+        """
+        import requests
+        
+        # Buffer the date range slightly
+        adj_start = start_date - timedelta(days=5)
+        adj_end = end_date + timedelta(days=5)
+        
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+        params = {
+            "interval": "1d",
+            "period1": int(adj_start.timestamp()),
+            "period2": int(adj_end.timestamp()),
+            "includeAdjustedClose": "true",
+        }
+        headers = {"User-Agent": "Mozilla/5.0"}
+        
+        daily_prices = {}
+        try:
+            resp = requests.get(url, params=params, headers=headers, timeout=10)
+            resp.raise_for_status()
+            
+            data = resp.json()
+            if "chart" not in data or not data["chart"].get("result"):
+                if "chart" in data and data["chart"].get("error"):
+                     error_code = data["chart"]["error"].get("code")
+                     logger.warning(f"Yahoo API returned error for daily prices: {error_code}")
+                     raise ValueError(f"Yahoo API error: {error_code}")
+                return {}
+                
+            result = data["chart"]["result"][0]
+            timestamps = result.get("timestamp", [])
+            indicators = result.get("indicators", {})
+            adj_close_obj = indicators.get("adjclose", [{}])[0]
+            adj_closes = adj_close_obj.get("adjclose", [])
+            
+            for i, ts in enumerate(timestamps):
+                if i >= len(adj_closes): 
+                    break
+                
+                ac = adj_closes[i]
+                if ac is None:
+                    continue
+                    
+                dt_str = datetime.fromtimestamp(ts, UTC_TZ).date().isoformat()
+                daily_prices[dt_str] = float(ac)
+                    
+        except Exception as e:
+            logger.error(f"CRITICAL: Failed to fetch daily reference prices for {ticker}: {e}")
+            raise 
+            
+        return daily_prices
+
+    def _align_timestamp(self, ts: int, interval: str) -> int:
+        """
+        Aligns a unix timestamp to the start of the interval bucket.
+        Useful because Yahoo sometimes returns the 'last trade time' for the most recent bar
+        instead of the bucket start time, causing misalignment and flat candles in the chart.
+        """
+        if not interval:
+            return ts
+        
+        # Parse interval (e.g. "1m", "5m", "1h", "1d")
+        # Only align minute-based intervals to avoid messing up daily/weekly timings
+        try:
+            if interval.endswith("m"):
+                minutes = int(interval[:-1])
+                seconds = minutes * 60
+                return ts - (ts % seconds)
+            elif interval.endswith("h"):
+                hours = int(interval[:-1])
+                seconds = hours * 3600
+                return ts - (ts % seconds)
+        except Exception:
+            pass
+            
+        return ts
 
     def _fetch_direct_yahoo_finance_chunk(self, ticker: str, start_date: datetime, end_date: datetime, interval: str) -> List[Dict]:
         import requests
@@ -369,11 +452,19 @@ class StockDataProducer:
             logger.warning("Start >= end in chunk fetch; adjusting", extra={"ticker": ticker, "start": start_date.isoformat(), "end": end_date.isoformat()})
             end_date = start_date + timedelta(days=1)
 
+        # 1. Fetch Daily Reference Prices (The "Answer Key")
+        is_intraday = interval.endswith("m") or interval.endswith("h")
+        daily_targets = {}
+        if is_intraday:
+            daily_targets = self._fetch_daily_adjusted_closes(ticker, start_date, end_date)
+
+        # 2. Fetch the actual chunk
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
         params = {
             "interval": interval,
             "period1": int(start_date.timestamp()),
             "period2": int(end_date.timestamp()),
+            "includeAdjustedClose": "true",
         }
         headers = {"User-Agent": "Mozilla/5.0"}
 
@@ -386,7 +477,7 @@ class StockDataProducer:
             timestamps = result.get("timestamp", [])
             indicators = result.get("indicators", {})
             quote = indicators.get("quote", [{}])[0]
-
+            
             open_prices = quote.get("open", [])
             high_prices = quote.get("high", [])
             low_prices = quote.get("low", [])
@@ -399,10 +490,44 @@ class StockDataProducer:
 
             aligned = []
             for i in range(min_length):
-                o, h, l, c, v = open_prices[i], high_prices[i], low_prices[i], close_prices[i], volumes[i]
+                ts = timestamps[i]
+                
+                # Align timestamp to interval (fix for live ticks)
+                ts = self._align_timestamp(ts, interval)
+                
+                o = open_prices[i]
+                h = high_prices[i]
+                l = low_prices[i]
+                c = close_prices[i]
+                v = volumes[i]
+                
                 if o is None or h is None or l is None or c is None:
                     continue
-                ts_utc = pd.to_datetime(timestamps[i], unit="s", utc=True)
+
+                ts_utc = datetime.fromtimestamp(ts, UTC_TZ)
+                
+                # NEW ADJUSTMENT LOGIC: Compare Intraday Close to Daily Target
+                ratio = 1.0
+                if is_intraday:
+                    dt_str = datetime.fromtimestamp(ts, UTC_TZ).date().isoformat()
+                    if dt_str in daily_targets:
+                        target_price = daily_targets[dt_str]
+                        # Calculate ratio: target / current
+                        if c != 0:
+                            implied_ratio = target_price / c
+                            
+                            # Only apply if diff > 10% (avoid micro-adjustment of intraday vs daily close noise)
+                            if abs(implied_ratio - 1.0) > 0.1:
+                                ratio = implied_ratio
+
+                if abs(ratio - 1.0) > 0.0001:
+                    o = o * ratio
+                    h = h * ratio
+                    l = l * ratio
+                    c = c * ratio # Use calculated ratio on Close as well
+                    if v is not None:
+                        v = int(float(v) / ratio)
+
                 aligned.append({
                     "timestamp": ts_utc,
                     "Open": float(o),
@@ -501,7 +626,12 @@ class StockDataProducer:
         try:
             for attempt in range(attempts):
                 try:
-                    return self._fetch_direct_yahoo_finance_chunk(ticker, start_date, end_date, try_first_interval)
+                    res = self._fetch_direct_yahoo_finance_chunk(ticker, start_date, end_date, try_first_interval)
+                    if res:
+                        return res
+                    # If empty result, break retry loop to try fallbacks
+                    # (Unless it's a 422 which is handled below, but empty list usually means valid request but no data for this interval)
+                    break
                 except requests.exceptions.HTTPError as e:
                     status = getattr(e.response, "status_code", None)
                     if status == 422:
@@ -530,7 +660,11 @@ class StockDataProducer:
 
         for iv in fallback_order:
             try:
-                return self._fetch_direct_yahoo_finance_chunk(ticker, start_date, end_date, iv)
+                res = self._fetch_direct_yahoo_finance_chunk(ticker, start_date, end_date, iv)
+                if res:
+                    return res
+                # If empty, continue to next fallback
+                continue
             except requests.exceptions.HTTPError as e:
                 if getattr(e.response, "status_code", None) == 422:
                     continue
@@ -645,9 +779,15 @@ class StockDataProducer:
 
             last_state_ts = self.state_manager.get_last_timestamp(ticker)
             if not performed_backfill and last_state_ts:
-                filtered = [m for m in messages if datetime.fromtimestamp(m["timestamp"], tz=UTC_TZ) > last_state_ts]
+                # Relax filter to allow re-emitting recent data (e.g. last 5 mins)
+                # This ensures that if Volume arrives late (after price), we capture the update.
+                # Downstream Spark Bronze/Silver jobs handle deduplication/merging.
+                cutoff = last_state_ts - timedelta(minutes=5)
+                filtered = [m for m in messages if datetime.fromtimestamp(m["timestamp"], tz=UTC_TZ) >= cutoff]
+                
+                # Check if we are really filtering anything to avoid debug spam
                 if len(filtered) < len(messages):
-                    logger.debug("Filtered already-processed messages", extra={"ticker": ticker, "filtered": len(messages) - len(filtered)})
+                     pass 
                 messages = filtered
 
             failed = []

@@ -44,7 +44,10 @@ def _write_gold_to_timescale(df: pl.DataFrame):
             pl.col("rsi_14"),
             pl.col("market_phase"),
             pl.col("daily_return"),
-            pl.col("volatility_5m")
+            pl.col("volatility_5m"),
+            pl.col("macd"),
+            pl.col("macd_signal"),
+            pl.col("macd_histogram")
         ]).rows()
         
         # Upsert to gold_stocks
@@ -53,9 +56,10 @@ def _write_gold_to_timescale(df: pl.DataFrame):
             ts, symbol, close, volume,
             sma_5, sma_20, sma_50,
             ema_9, ema_21, rsi_14,
-            market_phase, daily_return, volatility_5m
+            market_phase, daily_return, volatility_5m,
+            macd, macd_signal, macd_histogram
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (ts, symbol)
         DO UPDATE SET
             close = EXCLUDED.close,
@@ -68,7 +72,10 @@ def _write_gold_to_timescale(df: pl.DataFrame):
             rsi_14 = EXCLUDED.rsi_14,
             market_phase = EXCLUDED.market_phase,
             daily_return = EXCLUDED.daily_return,
-            volatility_5m = EXCLUDED.volatility_5m;
+            volatility_5m = EXCLUDED.volatility_5m,
+            macd = EXCLUDED.macd,
+            macd_signal = EXCLUDED.macd_signal,
+            macd_histogram = EXCLUDED.macd_histogram;
         """
         
         cursor.executemany(insert_query, data)
@@ -133,8 +140,26 @@ async def run_gold():
                     pl.col("close").pct_change().over("symbol").alias("daily_return"),
                     
                     # Volatility (Rolling StdDev)
-                    pl.col("close").pct_change().rolling_std(5).over("symbol").alias("volatility_5m")
+                    pl.col("close").pct_change().rolling_std(5).over("symbol").alias("volatility_5m"),
+
+                    # MACD Calculation
+                    # 1. Calculate Fast and Slow EMAs
+                    pl.col("close").ewm_mean(span=12, adjust=False).over("symbol").alias("ema_12"),
+                    pl.col("close").ewm_mean(span=26, adjust=False).over("symbol").alias("ema_26")
                 ])
+                
+                # 2. Calculate MACD Line, Signal Line, and Histogram
+                df_gold = df_gold.with_columns(
+                    (pl.col("ema_12") - pl.col("ema_26")).alias("macd")
+                )
+
+                df_gold = df_gold.with_columns(
+                    pl.col("macd").ewm_mean(span=9, adjust=False).over("symbol").alias("macd_signal")
+                )
+
+                df_gold = df_gold.with_columns(
+                    (pl.col("macd") - pl.col("macd_signal")).alias("macd_histogram")
+                )
                 
                 # RSI Calculation
                 def calculate_rsi(series, period=14):
@@ -172,12 +197,17 @@ async def run_gold():
                 logger.info(f"Updated Gold layer: {df_gold.height} records (full recalc for indicators)")
                 
                 # OPTIMIZED: Only sync NEW records to TimescaleDB based on checkpoint
-                if last_gold_checkpoint_ts > 0:
-                    # Filter for NEW records where ts (as epoch) > checkpoint
-                    # Convert datetime column to epoch seconds for comparison
-                    df_new_gold = df_gold.filter(
-                        (pl.col("ts").dt.epoch(time_unit="s")) > last_gold_checkpoint_ts
-                    )
+                # FORCE FULL SYNC: Bypass checkpoint filtering to ensure backfill data is not skipped
+                if True: # Always process all records
+                    df_new_gold = df_gold
+                    # if last_gold_checkpoint_ts > 0:
+                    #     # Filter for NEW records where ts (as epoch) > checkpoint
+                    #     # Convert datetime column to epoch seconds for comparison
+                    #     df_new_gold = df_gold.filter(
+                    #         (pl.col("ts").dt.epoch(time_unit="s")) > last_gold_checkpoint_ts
+                    #     )
+                    # else:
+                    #     df_new_gold = df_gold
                     
                     if df_new_gold.height > 0:
                         logger.info(f"Syncing {df_new_gold.height} NEW rows to TimescaleDB gold_stocks (checkpoint-based)")
