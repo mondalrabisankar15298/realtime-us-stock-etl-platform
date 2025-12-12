@@ -332,7 +332,7 @@ class StockDataProducer:
         now = datetime.now(UTC_TZ)
         if last_timestamp is None:
             logger.warning("Incremental called with no last_timestamp; performing short backfill", extra={"ticker": ticker})
-            start = now - timedelta(minutes=10)
+            start = now - timedelta(minutes=60)
             return self._fetch_direct_yahoo_finance_chunk(ticker, start, now, "1m")
 
         if last_timestamp >= now:
@@ -341,16 +341,20 @@ class StockDataProducer:
             return []
 
         gap_seconds = (now - last_timestamp).total_seconds()
-        if gap_seconds < 60:
-            logger.debug(f"No new data for {ticker}, gap {gap_seconds:.1f}s")
+        if gap_seconds < 15: # Tiny gap, skip
             return []
 
         if gap_seconds > (2.1 * 24 * 3600):
             return self._fetch_direct_yahoo_finance_incremental_catchup(ticker, last_timestamp)
 
-        # Fetch a larger window (e.g. 15 mins) to ensure we get valid volume data
-        # Yahoo sometimes returns partial/zero data if the requested window is too narrow.
-        start = now - timedelta(minutes=15)
+        # Logic for gaps (seconds to hours)
+        # 1. Start from last_timestamp - buffer (to ensure connectivity)
+        start = last_timestamp - timedelta(minutes=1)
+        
+        # 2. Ensure total window is at least 15 mins (for Yahoo volume context)
+        if (now - start) < timedelta(minutes=15):
+             start = now - timedelta(minutes=15)
+             
         end = now
         return self._fetch_direct_yahoo_finance_chunk(ticker, start, end, "1m")
 
@@ -779,10 +783,9 @@ class StockDataProducer:
 
             last_state_ts = self.state_manager.get_last_timestamp(ticker)
             if not performed_backfill and last_state_ts:
-                # Relax filter to allow re-emitting recent data (e.g. last 5 mins)
-                # This ensures that if Volume arrives late (after price), we capture the update.
-                # Downstream Spark Bronze/Silver jobs handle deduplication/merging.
-                cutoff = last_state_ts - timedelta(minutes=5)
+                # Relax filter to allow re-emitting recent data (e.g. last 20 mins)
+                # This ensures that if Volume arrives late (up to 20 mins), we capture the update.
+                cutoff = last_state_ts - timedelta(minutes=20)
                 filtered = [m for m in messages if datetime.fromtimestamp(m["timestamp"], tz=UTC_TZ) >= cutoff]
                 
                 # Check if we are really filtering anything to avoid debug spam
