@@ -31,6 +31,9 @@ def _write_gold_to_timescale(df: pl.DataFrame):
         cursor = conn.cursor()
         
         # Prepare data matching gold_stocks schema
+        # Schema: ts, symbol, close, volume, sma_5, sma_20, sma_50, ema_9, ema_21, 
+        #         rsi_14, upper_band, lower_band, vwap, market_phase, trading_signal, 
+        #         daily_return, volatility_5m, macd, macd_signal, macd_histogram
         data = df.select([
             pl.col("ts"),
             pl.col("symbol"),
@@ -42,12 +45,19 @@ def _write_gold_to_timescale(df: pl.DataFrame):
             pl.col("ema_9"),
             pl.col("ema_21"),
             pl.col("rsi_14"),
+            pl.col("upper_band"),
+            pl.col("lower_band"),
+            pl.col("vwap"),
             pl.col("market_phase"),
+            pl.col("trading_signal"),
             pl.col("daily_return"),
             pl.col("volatility_5m"),
             pl.col("macd"),
             pl.col("macd_signal"),
-            pl.col("macd_histogram")
+            pl.col("macd"),
+            pl.col("macd_signal"),
+            pl.col("macd_histogram"),
+            pl.col("atr_14")
         ]).rows()
         
         # Upsert to gold_stocks
@@ -56,10 +66,13 @@ def _write_gold_to_timescale(df: pl.DataFrame):
             ts, symbol, close, volume,
             sma_5, sma_20, sma_50,
             ema_9, ema_21, rsi_14,
-            market_phase, daily_return, volatility_5m,
-            macd, macd_signal, macd_histogram
+            upper_band, lower_band, vwap,
+            market_phase, trading_signal,
+            daily_return, volatility_5m,
+            macd, macd_signal, macd_histogram,
+            atr_14
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (ts, symbol)
         DO UPDATE SET
             close = EXCLUDED.close,
@@ -70,12 +83,17 @@ def _write_gold_to_timescale(df: pl.DataFrame):
             ema_9 = EXCLUDED.ema_9,
             ema_21 = EXCLUDED.ema_21,
             rsi_14 = EXCLUDED.rsi_14,
+            upper_band = EXCLUDED.upper_band,
+            lower_band = EXCLUDED.lower_band,
+            vwap = EXCLUDED.vwap,
             market_phase = EXCLUDED.market_phase,
+            trading_signal = EXCLUDED.trading_signal,
             daily_return = EXCLUDED.daily_return,
             volatility_5m = EXCLUDED.volatility_5m,
             macd = EXCLUDED.macd,
             macd_signal = EXCLUDED.macd_signal,
-            macd_histogram = EXCLUDED.macd_histogram;
+            macd_histogram = EXCLUDED.macd_histogram,
+            atr_14 = EXCLUDED.atr_14;
         """
         
         cursor.executemany(insert_query, data)
@@ -143,12 +161,31 @@ async def run_gold():
                     pl.col("close").pct_change().rolling_std(5).over("symbol").alias("volatility_5m"),
 
                     # MACD Calculation
-                    # 1. Calculate Fast and Slow EMAs
                     pl.col("close").ewm_mean(span=12, adjust=False).over("symbol").alias("ema_12"),
                     pl.col("close").ewm_mean(span=26, adjust=False).over("symbol").alias("ema_26")
                 ])
                 
-                # 2. Calculate MACD Line, Signal Line, and Histogram
+                # VWAP Calculation (Rolling 20 periods for streaming approx or CumSum if possible)
+                # Using CumSum relative to the loaded batch (as we load full history for now)
+                # Or a simple rolling VWAP
+                df_gold = df_gold.with_columns(
+                     (pl.col("close") * pl.col("volume")).alias("pv")
+                )
+                df_gold = df_gold.with_columns(
+                     (pl.col("pv").rolling_sum(20).over("symbol") / pl.col("volume").rolling_sum(20).over("symbol")).alias("vwap")
+                )
+
+                # Bollinger Bands
+                df_gold = df_gold.with_columns(
+                    pl.col("close").rolling_std(20).over("symbol").alias("std_20")
+                )
+                
+                df_gold = df_gold.with_columns([
+                     (pl.col("sma_20") + (2 * pl.col("std_20"))).alias("upper_band"),
+                     (pl.col("sma_20") - (2 * pl.col("std_20"))).alias("lower_band")
+                ])
+                
+                # MACD Line, Signal Line, and Histogram
                 df_gold = df_gold.with_columns(
                     (pl.col("ema_12") - pl.col("ema_26")).alias("macd")
                 )
@@ -175,6 +212,26 @@ async def run_gold():
                      calculate_rsi(pl.col("close")).over("symbol").alias("rsi_14")
                 )
                 
+                # ATR Calculation
+                # TR = Max(High-Low, Abs(High-Close_prev), Abs(Low-Close_prev))
+                df_gold = df_gold.with_columns(
+                     pl.col("close").shift(1).over("symbol").alias("prev_close")
+                )
+                df_gold = df_gold.with_columns(
+                     pl.max_horizontal([
+                         (pl.col("high") - pl.col("low")),
+                         (pl.col("high") - pl.col("prev_close")).abs(),
+                         (pl.col("low") - pl.col("prev_close")).abs()
+                     ]).alias("tr")
+                )
+                df_gold = df_gold.with_columns(
+                     pl.col("tr").rolling_mean(14).over("symbol").alias("atr_14")
+                )
+                # Fill null ATR with 0 or fill_null strategy
+                df_gold = df_gold.with_columns(
+                     pl.col("atr_14").fill_null(0)
+                )
+                
                 # Market Phase
                 df_gold = df_gold.with_columns(
                     pl.when((pl.col("close") > pl.col("ema_9")) & (pl.col("ema_9") > pl.col("ema_21")))
@@ -185,8 +242,30 @@ async def run_gold():
                     .alias("market_phase")
                 )
                 
+                # Trading Signals
+                # BUY: RSI < 30 AND MACD crossing UP (historgram becoming positive or just > signal)
+                # SELL: RSI > 70 AND MACD crossing DOWN
+                # NEUTRAL: Otherwise
+                
+                # Simple logic for now: State based
+                df_gold = df_gold.with_columns(
+                    pl.when((pl.col("rsi_14") < 35) & (pl.col("macd_histogram") > 0))
+                    .then(pl.lit("BUY"))
+                    .when((pl.col("rsi_14") > 65) & (pl.col("macd_histogram") < 0))
+                    .then(pl.lit("SELL"))
+                    .otherwise(pl.lit("NEUTRAL"))
+                    .alias("trading_signal")
+                )
+                
+                # Fill nulls for new columns to avoid DB errors if any
+                # Use fill_nan THEN fill_null to catch both cases
+                df_gold = df_gold.with_columns([
+                    pl.col("vwap").fill_nan(pl.col("close")).fill_null(pl.col("close")),
+                    pl.col("upper_band").fill_nan(pl.col("close")).fill_null(pl.col("close")),
+                    pl.col("lower_band").fill_nan(pl.col("close")).fill_null(pl.col("close"))
+                ])
+
                 # Write to Gold Delta (overwrite because we recalculate all indicators)
-                # Note: We need full history for rolling calculations, so overwrite is appropriate here
                 write_deltalake(
                     DELTA_PATH_GOLD,
                     df_gold.to_arrow(),
@@ -196,38 +275,19 @@ async def run_gold():
                 
                 logger.info(f"Updated Gold layer: {df_gold.height} records (full recalc for indicators)")
                 
-                # OPTIMIZED: Only sync NEW records to TimescaleDB based on checkpoint
-                # FORCE FULL SYNC: Bypass checkpoint filtering to ensure backfill data is not skipped
-                if True: # Always process all records
+                # FORCE FULL SYNC: Bypass checkpoint for now to backfill everything since we dropped table
+                if True:
                     df_new_gold = df_gold
-                    # if last_gold_checkpoint_ts > 0:
-                    #     # Filter for NEW records where ts (as epoch) > checkpoint
-                    #     # Convert datetime column to epoch seconds for comparison
-                    #     df_new_gold = df_gold.filter(
-                    #         (pl.col("ts").dt.epoch(time_unit="s")) > last_gold_checkpoint_ts
-                    #     )
-                    # else:
-                    #     df_new_gold = df_gold
-                    
                     if df_new_gold.height > 0:
-                        logger.info(f"Syncing {df_new_gold.height} NEW rows to TimescaleDB gold_stocks (checkpoint-based)")
+                        logger.info(f"Syncing {df_new_gold.height} NEW rows to TimescaleDB gold_stocks")
                         _write_gold_to_timescale(df_new_gold)
                         
-                        # Update checkpoint with max ts
+                        # Update checkpoint
                         max_ts_epoch = df_new_gold.select(pl.col("ts").dt.epoch(time_unit="s").max()).item()
                         write_checkpoint('gold', max_ts_epoch)
                         logger.info(f"Updated Gold checkpoint: max_ts={max_ts_epoch}")
                     else:
                         logger.info("No new Gold records to sync to TimescaleDB")
-                else:
-                    # First run - sync all data
-                    logger.info(f"Syncing {df_gold.height} rows to TimescaleDB gold_stocks (initial load)")
-                    _write_gold_to_timescale(df_gold)
-                    
-                    # Create checkpoint with max ts as epoch
-                    max_ts_epoch = df_gold.select(pl.col("ts").dt.epoch(time_unit="s").max()).item()
-                    write_checkpoint('gold', max_ts_epoch)
-                    logger.info(f"Created Gold checkpoint: max_ts={max_ts_epoch}")
                 
                 last_processed_version = current_version
             

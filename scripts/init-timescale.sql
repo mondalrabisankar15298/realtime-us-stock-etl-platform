@@ -18,24 +18,6 @@ CREATE EXTENSION IF NOT EXISTS timescaledb;
 -- Gold Layer Table (Main Dashboard Data)
 -- ==========================================
 CREATE TABLE IF NOT EXISTS gold_stocks (
-    symbol VARCHAR(10) NOT NULL,
-    ts TIMESTAMPTZ NOT NULL,
-    close DOUBLE PRECISION,
-    volume BIGINT,
-    
-    -- Technical Indicators
-    sma_5 DOUBLE PRECISION,
-    sma_20 DOUBLE PRECISION,
-    sma_50 DOUBLE PRECISION,
-    ema_9 DOUBLE PRECISION,
-    ema_21 DOUBLE PRECISION,
-    rsi_14 DOUBLE PRECISION,
-    vwap DOUBLE PRECISION,
-    macd DOUBLE PRECISION,
-    macd_signal DOUBLE PRECISION,
-    macd_histogram DOUBLE PRECISION,
-    atr_14 DOUBLE PRECISION,
-    
     -- Derived Metrics
     daily_return DOUBLE PRECISION,
     volatility_5m DOUBLE PRECISION,
