@@ -18,9 +18,31 @@ CREATE EXTENSION IF NOT EXISTS timescaledb;
 -- Gold Layer Table (Main Dashboard Data)
 -- ==========================================
 CREATE TABLE IF NOT EXISTS gold_stocks (
+    -- Core Metrics
+    close DOUBLE PRECISION,
+    volume BIGINT,
+    
+    -- Moving Averages
+    sma_5 DOUBLE PRECISION,
+    sma_20 DOUBLE PRECISION,
+    sma_50 DOUBLE PRECISION,
+    ema_9 DOUBLE PRECISION,
+    ema_21 DOUBLE PRECISION,
+    
+    -- Indicators
+    rsi_14 DOUBLE PRECISION,
+    upper_band DOUBLE PRECISION,
+    lower_band DOUBLE PRECISION,
+    vwap DOUBLE PRECISION,
+    trading_signal VARCHAR(20),
+    macd DOUBLE PRECISION,
+    macd_signal DOUBLE PRECISION,
+    macd_histogram DOUBLE PRECISION,
+
     -- Derived Metrics
     daily_return DOUBLE PRECISION,
     volatility_5m DOUBLE PRECISION,
+    atr_14 DOUBLE PRECISION,
     market_phase VARCHAR(20),
     price_change_pct DOUBLE PRECISION,
     computed_at TIMESTAMPTZ,
@@ -175,20 +197,28 @@ FROM gold_stocks
 ORDER BY symbol, ts DESC;
 
 -- Top gainers/losers view
+-- Top gainers/losers view
 CREATE OR REPLACE VIEW top_movers AS
+WITH daily_vols AS (
+    SELECT symbol, SUM(volume) as daily_volume
+    FROM gold_stocks
+    WHERE ts >= NOW() - INTERVAL '24 hours'
+    GROUP BY symbol
+)
 SELECT 
-    symbol,
-    price as current_price,
-    daily_return,
-    rsi_14,
-    volume,
+    lp.symbol,
+    lp.price as current_price,
+    lp.daily_return,
+    lp.rsi_14,
+    COALESCE(dv.daily_volume, 0) as volume,
     CASE 
-        WHEN daily_return > 0 THEN 'gainer'
-        WHEN daily_return < 0 THEN 'loser'
+        WHEN lp.daily_return > 0 THEN 'gainer'
+        WHEN lp.daily_return < 0 THEN 'loser'
         ELSE 'flat'
     END as movement_type
-FROM latest_prices
-ORDER BY ABS(daily_return) DESC;
+FROM latest_prices lp
+LEFT JOIN daily_vols dv ON lp.symbol = dv.symbol
+ORDER BY ABS(lp.daily_return) DESC;
 
 -- RSI signals view
 CREATE OR REPLACE VIEW rsi_signals AS

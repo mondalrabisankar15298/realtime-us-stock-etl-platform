@@ -54,8 +54,6 @@ def _write_gold_to_timescale(df: pl.DataFrame):
             pl.col("volatility_5m"),
             pl.col("macd"),
             pl.col("macd_signal"),
-            pl.col("macd"),
-            pl.col("macd_signal"),
             pl.col("macd_histogram"),
             pl.col("atr_14")
         ]).rows()
