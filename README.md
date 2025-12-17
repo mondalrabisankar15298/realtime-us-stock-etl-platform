@@ -36,6 +36,7 @@ This platform continuously streams 1-minute OHLCV (Open, High, Low, Close, Volum
     -   **Polars ETL**: A lightweight, high-performance alternative for single-node efficiency.
 -   **Observability**: Integrated **Loki & Promtail** stack for centralized container log monitoring.
 -   **Reliability**: Robust error handling with persistent state management and automatic retries.
+-   **Development**: Built using **Cursor** and **Antigravity** AI Editor, increasing development speed by **5-10x**.
 
 > [!IMPORTANT]
 > **Data Source Credit**: This project utilizes the **Yahoo Finance API** for financial market data. Logic is implemented in `producer/producer.py` to fetch highly granular 1-minute interval data. All data usage complies with educational and non-commercial purposes.
@@ -160,6 +161,7 @@ Airflow is the nervous system of the platform, ensuring reliability and data int
 
 ### 1. Robust Data Ingestion
 -   **Smart Backfill**: Automatically detects gaps in data (e.g., after system downtime) and fetches historical data to fill the void up to 365 days.
+-   **Resilience**: distinct **checkpointing** mechanisms ensure zero data loss during restarts, while Spark **watermarking** handles late-arriving backfilled data correctly.
 -   **Rate Limiting**: Intelligent polite sleeping between requests to respect API limits.
 -   **Deep Validation**: Cross-verifies intraday ticks against daily adjusted close prices to ensure data accuracy.
 
@@ -227,4 +229,4 @@ For major changes, please open an issue first to discuss what you would like to 
 
 ---
 
-**Built with 🧡 for the Data Engineering Community.**
+**Built with 🧡 using Cursor & Antigravity.**
