@@ -11,8 +11,17 @@ A production-grade, high-latency streaming data pipeline designed to ingest, pro
 
 ## 📸 Dashboard Preview
 
-![Dashboard Overview](docs/dashboard3.png)
-*Real-time market insights featuring live price ticks, technical indicators, and system health metrics.*
+### 1. Market Overview
+![Market Overview](docs/dashboard3-1.png)
+*Real-time ticker tape, price movements, and volume heatmaps.*
+
+### 2. Technical Intelligence
+![Technical Indicators](docs/dashboard3-2.png)
+*Live MACD, RSI, and Bollinger Brand trend analysis.*
+
+### 3. System Health & Logs
+![System Health](docs/dashboard3-3.png)
+*Producer heartbeat, consumer lag, and container health metrics.*
 
 ---
 
