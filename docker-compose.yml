@@ -501,6 +501,36 @@ services:
       timeout: 5s
       retries: 5
 
+  # ==========================================
+  # Logging Stack (Loki + Promtail)
+  # ==========================================
+  loki:
+    image: grafana/loki:3.0.0
+    container_name: loki
+    user: "0"
+    volumes:
+      - ./logging/loki-config.yaml:/etc/loki/local-config.yaml
+      - loki-data:/tmp/loki
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - stock-etl-network
+    restart: unless-stopped
+
+  promtail:
+    image: grafana/promtail:3.0.0
+    container_name: promtail
+    volumes:
+      - ./logging/promtail-config.yaml:/etc/promtail/config.yml
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: -config.file=/etc/promtail/config.yml
+    networks:
+      - stock-etl-network
+    depends_on:
+      - loki
+    restart: unless-stopped
+
 volumes:
   redpanda-data:
   spark-delta-tables:
@@ -508,6 +538,7 @@ volumes:
   postgres-airflow-data:
   timescale-data:
   grafana-data:
+  loki-data:
 
 
 networks:
